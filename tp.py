@@ -11,7 +11,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed import _functional_collectives as funcol
 
-from model import Attention, FeedForward, Transformer
+from model import Attention, FeedForward, Transformer, MixtralSparseMoeBlock, MixtralBlock
 from quantize import WeightOnlyInt4Linear
 
 
@@ -142,10 +142,16 @@ def _apply_tp_Transformer(Transformer: Transformer) -> None:
     Transformer.config.dim = Transformer.config.dim // world_size
     Transformer.config.n_local_heads = Transformer.config.n_local_heads // world_size
 
+def _apply_tp_mixtral_ffn(mlp: MixtralSparseMoeBlock):
+    for expert in mlp.experts:
+        _apply_tp_ffn(expert)
 
 def apply_tp(model: Transformer) -> None:
     _apply_tp_Transformer(model)
     for block in model.layers:
         # Apply to MLP
-        _apply_tp_ffn(block.feed_forward)
+        if isinstance(block, MixtralBlock):
+            _apply_tp_mixtral_ffn(block.block_sparse_moe)
+        else:
+            _apply_tp_ffn(block.feed_forward)
         _apply_tp_attn(block.attention)

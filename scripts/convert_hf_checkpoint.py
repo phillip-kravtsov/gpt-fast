@@ -31,12 +31,13 @@ def convert_hf_checkpoint(
     print(f"Model config {config.__dict__}")
 
     # Load the json file containing weight mapping
-    model_map_json = checkpoint_dir / "pytorch_model.bin.index.json"
-
+    model_map_json = checkpoint_dir / "model.safetensors.index.json"
     assert model_map_json.is_file()
 
-    with open(model_map_json) as json_map:
-        bin_index = json.load(json_map)
+    if model_map_json.is_file():
+        with open(model_map_json) as json_map:
+            bin_index = json.load(json_map)
+        bin_files = {checkpoint_dir / bin for bin in bin_index["weight_map"].values()}
 
     weight_map = {
         "model.embed_tokens.weight": "tok_embeddings.weight",
@@ -50,10 +51,11 @@ def convert_hf_checkpoint(
         "model.layers.{}.mlp.down_proj.weight": "layers.{}.feed_forward.w2.weight",
         "model.layers.{}.input_layernorm.weight": "layers.{}.attention_norm.weight",
         "model.layers.{}.post_attention_layernorm.weight": "layers.{}.ffn_norm.weight",
+        'model.layers.{}.block_sparse_moe.experts.{}.w{}.weight': 'layers.{}.block_sparse_moe.experts.{}.w{}.weight',
+        'model.layers.{}.block_sparse_moe.gate.weight': 'layers.{}.block_sparse_moe.gate.weight',
         "model.norm.weight": "norm.weight",
         "lm_head.weight": "output.weight",
     }
-    bin_files = {checkpoint_dir / bin for bin in bin_index["weight_map"].values()}
 
     def permute(w, n_head):
         dim = config.dim
@@ -65,18 +67,29 @@ def convert_hf_checkpoint(
 
     merged_result = {}
     for file in sorted(bin_files):
-        state_dict = torch.load(str(file), map_location="cpu", mmap=True, weights_only=True)
+        from safetensors.torch import load_file
+        state_dict = load_file(str(file), device='cpu')
+        #state_dict = torch.load(str(file), map_location="cpu", mmap=True, weights_only=True)
         merged_result.update(state_dict)
+
     final_result = {}
     for key, value in merged_result.items():
         if "layers" in key:
             abstract_key = re.sub(r'(\d+)', '{}', key)
             layer_num = re.search(r'\d+', key).group(0)
+            if abstract_key in weight_map.values():
+                continue
             new_key = weight_map[abstract_key]
             if new_key is None:
                 continue
-            new_key = new_key.format(layer_num)
+            if 'experts' in new_key:
+                layer_num, expert_num, linear_num = re.findall(r'\d+', key)
+                new_key = new_key.format(layer_num, expert_num, linear_num)
+            else:
+                new_key = new_key.format(layer_num)
         else:
+            if key in weight_map.values():
+                continue
             new_key = weight_map[key]
 
         final_result[new_key] = value

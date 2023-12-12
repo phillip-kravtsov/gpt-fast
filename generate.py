@@ -24,7 +24,7 @@ sys.path.append(str(wd))
 
 from sentencepiece import SentencePieceProcessor
 
-from model import Transformer
+from model import Transformer, MixtralBlock
 from tp import maybe_init_dist
 
 
@@ -223,7 +223,8 @@ def _load_model(checkpoint_path, device, precision, use_tp):
         model = simple_quantizer.convert_for_runtime()
 
     checkpoint = torch.load(str(checkpoint_path), mmap=True, weights_only=True)
-    model.load_state_dict(checkpoint, assign=True)
+    model.load_state_dict(checkpoint, assign=True, strict=False)
+    print("loaded state dict.")
 
     if use_tp:
         from tp import apply_tp
