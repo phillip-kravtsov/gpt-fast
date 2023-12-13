@@ -375,13 +375,13 @@ def main(
         ]
     )
     if compile:
-        print("Compiling")
+        print("Compiling decode")
         fullgraph = False
         # torch._dynamo.config.capture_dynamic_output_shape_ops = True
-        torch._dynamo.config.cache_size_limit = 32
-        torch._inductor.config.triton.cudagraph_trees = (
-            False  # Bug with cudagraph trees in this case
-        )
+        if is_speculative and use_tp:
+            torch._inductor.config.triton.cudagraph_trees = (
+                False  # Bug with cudagraph trees in this case
+            )
 
         if is_speculative:
             global model_forward, logits_to_prob
@@ -396,6 +396,7 @@ def main(
 
         # Uncomment to squeeze more perf out of prefill
         if args.compile_prefill:
+            print("Compiling prefill")
             prefill = torch.compile(prefill, fullgraph=fullgraph, dynamic=True)
 
     aggregate_metrics = {
@@ -506,7 +507,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--num_samples", type=int, default=1, help="Number of samples.")
     parser.add_argument(
-        "--max_new_tokens", type=int, default=200, help="Maximum number of new tokens."
+        "--max_new_tokens", type=int, default=20, help="Maximum number of new tokens."
     )
     parser.add_argument("--top_k", type=int, default=200, help="Top-k for sampling.")
     parser.add_argument(

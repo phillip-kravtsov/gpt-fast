@@ -11,6 +11,9 @@ import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
 import torch.distributed as dist
+import torch._dynamo
+from torch.distributed import _functional_collectives as funcol
+
 
 import numpy as np
 
@@ -399,7 +402,6 @@ class BlockSparseMoE(nn.Module):
         self.gate = nn.Linear(
             self.hidden_dim, self.num_experts, bias=False, device="meta"
         )
-        # device=torch.cuda.current_device())
 
         # merged expert weights, all of size  (ffn_dim * n_experts, model_dim)
         self.w1 = nn.Parameter(
@@ -409,7 +411,6 @@ class BlockSparseMoE(nn.Module):
                 device="meta",
             )
         )
-        # device=torch.cuda.current_device()))
         self.w2 = nn.Parameter(
             torch.empty(
                 self.ffn_dim_per_partition * self.num_experts,
@@ -417,7 +418,6 @@ class BlockSparseMoE(nn.Module):
                 device="meta",
             )
         )
-        # device=torch.cuda.current_device()))
         self.w3 = nn.Parameter(
             torch.empty(
                 self.ffn_dim_per_partition * self.num_experts,
@@ -425,7 +425,6 @@ class BlockSparseMoE(nn.Module):
                 device="meta",
             )
         )
-        # device=torch.cuda.current_device()))
 
         # Calculate the number of bits needed to represent the expert indices
         # so that we can pass it to radix sort.
@@ -437,18 +436,6 @@ class BlockSparseMoE(nn.Module):
         # in the intermediate sparse matrix.
         max_column_index = (self.ffn_dim * self.num_experts) // self.blocking
         self.transpose_sort_end_bit = max(int(np.ceil(np.log2(max_column_index))), 1)
-
-    """
-    def moe_weight_loader(self, param: nn.Parameter,
-                          loaded_weight: torch.Tensor) -> None:
-        tp_rank = get_rank()
-        shard_size = self.ffn_dim_per_partition
-        loaded_weight = loaded_weight.view(self.num_experts, self.ffn_dim, -1)
-        loaded_weight = loaded_weight[:, shard_size * tp_rank:shard_size *
-                                      (tp_rank + 1)]
-        loaded_weight = loaded_weight.reshape_as(param)
-        param.data.copy_(loaded_weight)
-    """
 
     def sparse_transpose(
         self, size: int, row_indices, column_indices
@@ -511,7 +498,7 @@ class BlockSparseMoE(nn.Module):
             self.blocking,
             self.blocking,
             dtype=x.dtype,
-            device="meta",
+            device=torch.cuda.current_device(),
         )
         shape = (padded_tokens, self.ffn_dim_per_partition * self.num_experts)
         row_indices = stk.ops.row_indices(shape, data, offsets, column_indices)
@@ -553,26 +540,8 @@ class BlockSparseMoE(nn.Module):
         bins = promote_scalar(bins)
         return indices, bin_ids, bins, padded_bins, tokens_per_expert
 
-    @torch.inference_mode()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (sequence_length, model_dim)
-        gate_logits: (sequence_length, n_experts)
-        """
-        # optional reshape
-        input_shape = x.shape
-        x = x.view(-1, input_shape[-1])
-
-        # gate_logits: (sequence_length, n_experts)
-        gate_logits = self.gate(x)
-        # all_probs: (sequence_length, n_experts) and upcast for softmax
-        all_probs = F.softmax(gate_logits, dim=1, dtype=torch.float)
-        # weights, selected_experts: (sequence_length, top-k)
-        weights, selected_experts = torch.topk(all_probs, self.top_k, dim=-1)
-        weights /= weights.sum(dim=-1, keepdim=True)
-        weights = weights.flatten().to(x.dtype)
-        selected_experts = selected_experts.flatten()
-
+    @torch._dynamo.disable()
+    def suffix(self, x, weights, selected_experts):
         (indices, bin_ids, bins, padded_bins, _) = self.indices_and_padded_bins(
             selected_experts
         )
@@ -582,8 +551,7 @@ class BlockSparseMoE(nn.Module):
         x = ops.padded_gather(x, indices, bin_ids, bins, padded_bins, self.top_k)
 
         # Create the sparse matrix topology
-        with torch.no_grad():
-            topo = self.topology(x, padded_bins)
+        topo = self.topology(x, padded_bins)
 
         # Perform the expert computation
         # First Dense x Dense -> Sparse for w1 and w3,
@@ -604,6 +572,7 @@ class BlockSparseMoE(nn.Module):
         # (top_k * sequence_length + padding, model_dim)
         x = stk.ops.dsd(x, self.w2)
         dist.all_reduce(x)
+        # x = funcol.all_reduce(x, reduceOp='sum', group=list(range(2)))
 
         # Permute back and remove padding
         # (top_k * sequence_length, model_dim)
@@ -617,6 +586,28 @@ class BlockSparseMoE(nn.Module):
             self.top_k,
             self.quantize_scatter_num_bits,
         )
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (sequence_length, model_dim)
+        gate_logits: (sequence_length, n_experts)
+        """
+        # optional reshape
+        input_shape = x.shape
+        x = x.view(-1, input_shape[-1]).clone()
+
+        # gate_logits: (sequence_length, n_experts)
+        gate_logits = self.gate(x)
+        # all_probs: (sequence_length, n_experts) and upcast for softmax
+        all_probs = F.softmax(gate_logits, dim=1, dtype=torch.float)
+        # weights, selected_experts: (sequence_length, top-k)
+        weights, selected_experts = torch.topk(all_probs, self.top_k, dim=-1)
+        weights /= weights.sum(dim=-1, keepdim=True)
+        weights = weights.flatten()
+        # weights = weights.to(x.dtype)
+        selected_experts = selected_experts.flatten()
+        x = self.suffix(x, weights, selected_experts)
         return x.view(*input_shape)
 
 
