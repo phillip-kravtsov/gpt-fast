@@ -12,6 +12,7 @@ from torch import Tensor
 from torch.nn import functional as F
 import torch.distributed as dist
 import torch._dynamo
+from transformers.models.mixtral import modeling_mixtral as mm
 from torch.distributed import _functional_collectives as funcol
 
 
@@ -246,7 +247,8 @@ class MixtralBlock(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
         super().__init__()
         self.attention = Attention(config)
-        self.block_sparse_moe = BlockSparseMoE(config)
+        #self.block_sparse_moe = BlockSparseMoE(config)
+        self.block_sparse_moe = MixtralSparseMoeBlock(config)
         self.attention_norm = RMSNorm(config.dim, config.norm_eps)
         self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
 

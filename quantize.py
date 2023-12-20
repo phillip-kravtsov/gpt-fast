@@ -16,7 +16,7 @@ try:
 except:
     pass
 
-from model import Transformer
+from model import BlockSparseMoE
 
 ##### Quantization Primitives ######
 
@@ -344,6 +344,15 @@ class WeightOnlyInt8QuantHandler:
                 )
                 cur_state_dict[f"{fqn}.weight"] = int8_weight
                 cur_state_dict[f"{fqn}.scales"] = scales.to(mod.weight.dtype)
+            """
+            elif isinstance(mod, BlockSparseMoE):
+                int8_weight, scales, _ = dynamically_quantize_per_channel(
+                    mod.weight.float(), -128, 127, torch.int8
+                )
+                cur_state_dict[f"{fqn}.weight"] = int8_weight
+                cur_state_dict[f"{fqn}.scales"] = scales.to(mod.weight.dtype)
+            """
+
 
         return cur_state_dict
 
