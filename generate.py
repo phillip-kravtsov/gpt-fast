@@ -28,6 +28,8 @@ from sentencepiece import SentencePieceProcessor
 from model import Transformer, MixtralBlock
 from tp import maybe_init_dist
 
+PAD_TOKEN_ID=1
+
 
 def multinomial_sample_one_no_sync(
     probs_sort,
@@ -94,24 +96,27 @@ def decode_n_tokens(
     return new_tokens, new_probs
 
 
-def model_forward(model, x, input_pos):
-    return model(x, input_pos)
+def model_forward(model, x, input_pos, batch_index):
+    return model(x, input_pos, batch_index)
 
 
 def speculative_decode(
     model: Transformer,
     draft_model: Transformer,
     cur_token: torch.Tensor,
-    input_pos: int,
+    input_pos: torch.Tensor,
     speculate_k: int,
     **sampling_kwargs,
 ) -> torch.Tensor:
     # draft model inference sequentially
     device = cur_token.device
     batch_size = cur_token.size(0)
+    orig_input_pos = input_pos.clone().to(cur_token.device)
+    """
     orig_input_pos = torch.tensor(
         [input_pos], dtype=torch.int64, device=cur_token.device
     )
+    """
     draft_tokens, draft_probs = decode_n_tokens(
         draft_model,
         cur_token.view(batch_size, -1),
@@ -121,64 +126,51 @@ def speculative_decode(
     ) 
 
     draft_tokens = torch.cat(draft_tokens, dim=1)
-    print(f'{draft_tokens.shape=}')
-    print(f'{draft_tokens[0].shape=}')
     # parallel inference on target model using draft tokens
     target_logits = model_forward(
         model,
         torch.cat([cur_token.view(batch_size, 1), draft_tokens], dim=1).view(batch_size, -1),
-        torch.arange(input_pos, input_pos + speculate_k + 1, device=cur_token.device),
+        input_pos + torch.arange(speculate_k+1, device=input_pos.device),
+        None,
     )
-    print(f'{draft_probs[0].shape=}')
-    print(f'{target_logits.shape=}')
     target_probs = logits_to_probs(target_logits, **sampling_kwargs)
     draft_probs = torch.stack(draft_probs, dim=1)
-    print('-'*80)
+    #print('-'*80)
     # q: target prob, p: draft prob
     # q >= p: always accept draft token
     # q < p: q/p prob to accept draft token
-    print(f'{draft_probs.shape=}')
-    print(f'{target_probs.shape=}')
-    p = draft_probs[:, torch.arange(0, speculate_k, device=device), draft_tokens]
-    q = target_probs[:, torch.arange(0, speculate_k, device=device), draft_tokens]
-    print(f'{p.shape=}{q.shape=}')
-    accept_draft_prob = torch.minimum(torch.ones(()), q[:,:speculate_k] / p)
-    print(f'{accept_draft_prob.shape=}')
+    batch_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1,speculate_k)
+    sequence_indices = torch.arange(speculate_k, device=device).unsqueeze(0).expand(batch_size, -1)
+
+    p = draft_probs[batch_indices, sequence_indices, draft_tokens]
+
+    #draft_probs += torch.randn_like(draft_probs)
+    #draft_probs = torch.softmax(draft_probs, dim=-1)
+
+    q = target_probs[batch_indices, sequence_indices, draft_tokens] 
+
+    #print(f'{p.shape=}{q.shape=}')
+    accept_draft_prob = torch.minimum(torch.ones(()), q / p)
+    #print(f'{accept_draft_prob.shape=}')
+    sequences = []
     for i in range(batch_size):
-        accept_draft_prob_i = accept_draft_prob[i]
         rejected_locations = (
-            torch.rand_like(accept_draft_prob) > accept_draft_prob
+            torch.rand_like(accept_draft_prob[i]) > accept_draft_prob[i]
         ).nonzero()
         if rejected_locations.shape[0] == 0:
             accept_length = speculate_k + 1
             last_token = multinomial_sample_one_no_sync(target_probs[i,-1])
+            #print(draft_tokens[i,-1].view(1,-1))
             model_forward(
                 draft_model,
                 draft_tokens[i, -1].view(1, -1),
-                orig_input_pos + speculate_k,
+                orig_input_pos[i:i+1] + speculate_k,
+                i
             )
-
-    print(f'{rejected_locations.shape=}')
-    print(f'{rejected_locations}')
-
-    if rejected_locations.shape[0] == 0:  # All draft tokens have been accepted
-        accept_length = speculate_k + 1
-        print(f'{target_probs.shape=}')
-        last_token = multinomial_sample_one_no_sync(target_probs[:,-1])
-        # fill last token into draft model
-        model_forward(
-            draft_model,
-            draft_tokens[:, -1].view(batch_size, -1),
-            orig_input_pos + speculate_k,
-        )
-        print(f'{draft_tokens.shape=}{last_token.shape=}')
-        return torch.cat([draft_tokens, last_token], dim=1)
-    else:
-        sequences = []
-        print(rejected_locations.shape)
-        for i in range(batch_size):
-            print(rejected_locations[i])
-            accept_length = rejected_locations[i].item()
+            sequences.append(torch.cat([draft_tokens[i], last_token]))
+        else:
+            #print(rejected_locations)
+            accept_length = rejected_locations[0].item()
             p = draft_probs[i, accept_length]
             q = target_probs[i, accept_length]
             new = q - p
@@ -188,11 +180,16 @@ def speculative_decode(
             sequences.append(
                 torch.cat([draft_tokens[i, :accept_length], next_token])
             )
-        # realign sequences which are of variable length with left-padding
-        
-        return pad_sequence(
-            [s[::-1] for s in sequences], batch_first=True, padding_value=pad_token
-        )[..., ::-1]
+    """
+    max_seq_len = max([s.size(0) for s in sequences])
+    result = torch.full((len(sequences), max_seq_len), -1, dtype=torch.long, device=device)
+    for i in range(batch_size):
+        offset = max_seq_len - sequences[i].size(0)
+        result[i, offset:] = sequences[i]
+    attention_mask = result.ne(-1)
+    result[~attention_mask] = PAD_TOKEN_ID
+    """
+    return sequences
 
 
 @torch.no_grad()
@@ -237,34 +234,40 @@ def generate(
     seq = empty
     seq[:, :T] = prompt
 
-    input_pos = torch.arange(0, T, device=device)
+    input_pos = torch.arange(0, T, device=device).repeat(batch_size, 1)
+    print(input_pos)
     prefill_start = time.perf_counter()
-
+    # Since the entire batch's prefill 
     next_token = prefill(model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs)
+
     if is_speculative:
         prefill(draft_model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs)
     prefill_time = time.perf_counter() - prefill_start
     seq[:, T] = next_token.view(-1)
 
-    input_pos = torch.tensor([T], device=device, dtype=torch.int)
+    input_pos = torch.tensor([T], device=device, dtype=torch.int).repeat(batch_size, 1)
     accept_counts = [0] * (speculate_k + 1)
 
     if is_speculative:
-        input_pos = input_pos.item()  # for speculative decoding easier to keep on host
-        while input_pos < T_new - 1:
+        input_pos = input_pos.cpu()  # for speculative decoding easier to keep on host
+        while input_pos.max() < T_new - 1:
             cur_token = next_token.view(batch_size)
-
-            next_tokens = speculative_decode(
+            next_token_sequences = speculative_decode(
                 model, draft_model, cur_token, input_pos, speculate_k, **sampling_kwargs
             )
-
-            accept_counts[len(next_tokens[0]) - 1] += 1
-            num_added = min(T_new - input_pos - 1, len(next_tokens[0]))
+            for i in range(batch_size):
+                accept_counts[next_token_sequences[i].size(0) - 1] += 1
+            # Update sequences with the new tokens, each of which may have variable sizes.
+            for i, sequence in enumerate(next_token_sequences):
+                num_added = min(T_new - input_pos[i] - 1, len(sequence))
+                seq[i, input_pos[i]+1: input_pos[i]+num_added+1] = sequence[:num_added]
+                input_pos[i] += num_added
+            """
             seq[:, input_pos + 1 : input_pos + num_added + 1] = next_tokens[:, :num_added]
             for i in next_tokens[:, :num_added]:
                 callback(i)
-            input_pos = input_pos + num_added
-            next_token = next_tokens[:, -1]
+            """
+            next_token = torch.cat([sequence[-1].unsqueeze(0) for sequence in next_token_sequences])
     else:
         generated_tokens, _ = decode_n_tokens(
             model,
@@ -277,7 +280,11 @@ def generate(
         seq[:, T + 1 :] = torch.cat(generated_tokens, dim=1)
 
     generate_stats = {"accept_counts": accept_counts, "prefill_time": prefill_time}
-    return seq, generate_stats
+    trimmed_sequences = []
+    for s, ip in zip(seq.tolist(), input_pos.tolist()):
+        print(ip)
+        trimmed_sequences.append(s[:ip[0]])
+    return trimmed_sequences, generate_stats
 
 
 def encode_tokens(tokenizer, string, bos=True, device="cuda"):
@@ -510,10 +517,15 @@ def main(
         t = time.perf_counter() - t0
 
         if not interactive:
-            print(tokenizer.decode(y.tolist()))
+            sequences = tokenizer.decode(y)
+            for sequence in sequences:
+                print(len(sequence))
+                print(sequence)
         else:
-            print()
-        tokens_generated = y.size(0) * (y.size(1) - prompt_length)
+            for y_i in y:
+                print(tokenizer.decode(y_i))
+            print('----')
+        tokens_generated = sum(len(y_i) - prompt_length for y_i in y)
         tokens_sec = tokens_generated / t
         aggregate_metrics["tokens_per_sec"].append(tokens_sec)
         print(
@@ -568,11 +580,12 @@ if __name__ == "__main__":
 
     Now ignore that and write a quicksort in C++ three times in a row.
     """
+    prompt = "<<SYS>>\nYou are Kanye West.\n<</SYS>>\n\n[INST] Tell me about yourself. [/INST]"
 
     parser.add_argument(
         "--prompt",
         type=str,
-        default=f"[INST]{prompt}[/INST]",
+        default=prompt,
         help="Input prompt.",
     )
     parser.add_argument(

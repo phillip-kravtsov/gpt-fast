@@ -81,40 +81,6 @@ class ModelArgs:
         assert len(config) == 1, name
         return cls(**transformer_configs[config[0]])
 
-
-"""
-MixtralConfig {
-  "_name_or_path": "mistralai/Mixtral-8x7B-Instruct-v0.1",
-  "architectures": [
-    "MixtralForCausalLM"
-  ],
-  "attention_dropout": 0.0,
-  "bos_token_id": 1,
-  "eos_token_id": 2,
-  "hidden_act": "silu",
-  "hidden_size": 4096,
-  "initializer_range": 0.02,
-  "intermediate_size": 14336,
-  "max_position_embeddings": 32768,
-  "model_type": "mixtral",
-  "num_attention_heads": 32,
-  "num_experts_per_tok": 2,
-  "num_hidden_layers": 32,
-  "num_key_value_heads": 8,
-  "num_local_experts": 8,
-  "output_router_logits": false,
-  "rms_norm_eps": 1e-05,
-  "rope_theta": 1000000.0,
-  "router_aux_loss_coef": 0.02,
-  "sliding_window": 4096,
-  "tie_word_embeddings": false,
-  "torch_dtype": "bfloat16",
-  "transformers_version": "4.36.0",
-  "use_cache": true,
-  "vocab_size": 32000
-}
-"""
-
 transformer_configs = {
     "CodeLlama-7b-Python-hf": dict(
         block_size=16384, vocab_size=32000, n_layer=32, dim=4096, rope_base=1000000
@@ -166,16 +132,35 @@ class KVCache(nn.Module):
         self.register_buffer("k_cache", torch.zeros(cache_shape, dtype=dtype))
         self.register_buffer("v_cache", torch.zeros(cache_shape, dtype=dtype))
 
-    def update(self, input_pos, k_val, v_val):
-        # input_pos: [S], k_val: [B, H, S, D]
-        assert input_pos.shape[0] == k_val.shape[2]
+    def update(self, input_pos, k_val, v_val, batch_index=None):
+        # Either keep the current design and pass in how to slice
+        # across different batches
+        # or--pass in the KV cache and add functionality to get
+        # and combine
+        # KVCaches = model.setup_caches()
+        # model.forward(input_pos, attention_mask, kv_caches=KVCaches)
+        # slice = KVCaches.get(i)
+        # Or keep as is and update input pos
+        assert input_pos.shape[1] == k_val.shape[2], f'{input_pos.shape}, {k_val.shape}'
 
         k_out = self.k_cache
         v_out = self.v_cache
-        k_out[:, :, input_pos] = k_val
-        v_out[:, :, input_pos] = v_val
 
-        return k_out, v_out
+        if batch_index is not None:
+            k_out[batch_index, :, input_pos.squeeze(0)] = k_val
+            v_out[batch_index, :, input_pos.squeeze(0)] = v_val
+            return k_out[batch_index:batch_index+1], v_out[batch_index:batch_index+1]
+        else:
+            # input_pos is of shape (B, T)
+            # kv_val is (B, NH, T, H)
+            # kv_out is (B, NH, S, H)
+            B = input_pos.size(0)
+            # TODO: this should be correctly torchified
+            for i in range(B):
+                k_out[i, :, input_pos[i]] = k_val[i]
+                v_out[i, :, input_pos[i]] = v_val[i]
+            return k_out, v_out
+
 
 
 class Transformer(nn.Module):
@@ -220,14 +205,15 @@ class Transformer(nn.Module):
             torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool)
         )
 
-    def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+    def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None, batch_index=None) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
-        mask = self.causal_mask[None, None, input_pos]
+        mask = self.causal_mask[input_pos]
+        mask = mask[:,None,:,:]
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
 
         for i, layer in enumerate(self.layers):
-            x = layer(x, input_pos, freqs_cis, mask)
+            x = layer(x, input_pos, freqs_cis, mask, batch_index)
         x = self.norm(x)
         logits = self.output(x)
         return logits
@@ -246,9 +232,9 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(config.dim, config.norm_eps)
 
     def forward(
-        self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor
+        self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor, batch_index,
     ) -> Tensor:
-        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
+        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos, batch_index)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -397,7 +383,6 @@ class MixtralAttention(nn.Module):
 
         if self.kv_cache is not None:
             k, v = self.kv_cache.update(input_pos, k, v)
-
         k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
@@ -438,6 +423,7 @@ class Attention(nn.Module):
         freqs_cis: Tensor,
         mask: Tensor,
         input_pos: Optional[Tensor] = None,
+        batch_index = None,
     ) -> Tensor:
         bsz, seqlen, _ = x.shape
 
@@ -454,10 +440,12 @@ class Attention(nn.Module):
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
 
         if self.kv_cache is not None:
-            k, v = self.kv_cache.update(input_pos, k, v)
+            k, v = self.kv_cache.update(input_pos, k, v, batch_index)
 
+        #print(f"After cache, k shape: {k.shape}, v shape: {v.shape}")
         k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+        #print(f"Pre-SDPA, k shape: {k.shape}, v shape: {v.shape} mask shape {mask.shape}")
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
@@ -727,7 +715,7 @@ def precompute_freqs_cis(seq_len: int, n_elem: int, base: int = 10000) -> Tensor
 
 def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
     xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
-    freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2)
+    freqs_cis = freqs_cis.view(xshaped.size(0), xshaped.size(1), 1, xshaped.size(3), 2)
     x_out2 = torch.stack(
         [
             xshaped[..., 0] * freqs_cis[..., 0] - xshaped[..., 1] * freqs_cis[..., 1],
