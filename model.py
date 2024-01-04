@@ -12,7 +12,6 @@ from torch import Tensor
 from torch.nn import functional as F
 import torch.distributed as dist
 import torch._dynamo
-from transformers.models.mixtral import modeling_mixtral as mm
 from torch.distributed import _functional_collectives as funcol
 
 
@@ -25,7 +24,8 @@ def promote_scalar(x: torch.Tensor) -> torch.Tensor:
 
 try:
     import megablocks.ops as ops
-except ImportError:
+except ImportError as e:
+    print(e)
     print(
         "MegaBlocks not found, please see "
         "https://github.com/stanford-futuredata/megablocks/. "
@@ -119,6 +119,15 @@ transformer_configs = {
     "CodeLlama-7b-Python-hf": dict(
         block_size=16384, vocab_size=32000, n_layer=32, dim=4096, rope_base=1000000
     ),
+    "TinyLlama-1.1B-intermediate-step-480k-1T": dict(
+        block_size=2048,
+        vocab_size=32000,
+        dim=2048,
+        n_layer=22,
+        n_head=32,
+        n_local_heads=4,
+        intermediate_size=5632,
+    ),
     "7B": dict(n_layer=32, n_head=32, dim=4096),
     "13B": dict(n_layer=40, n_head=40, dim=5120),
     "30B": dict(n_layer=60, n_head=52, dim=6656),
@@ -135,6 +144,7 @@ transformer_configs = {
         n_layer=80, n_head=64, dim=8192, n_local_heads=8, intermediate_size=28672
     ),
     "Mixtral-8x7B-Instruct-v0.1": dict(
+        block_size=4096,
         n_layer=32,
         n_head=32,
         n_local_heads=8,
@@ -269,7 +279,7 @@ class MixtralSparseMoeBlock(nn.Module):
         self.top_k = config.num_experts_per_tok
         assert self.num_experts is not None and self.top_k is not None
         self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
-        self.register_buffer("eye", torch.eye(self.num_experts))
+        #self.register_buffer("eye", torch.eye(self.num_experts))
 
         self.experts = nn.ModuleList(
             [FeedForward(config) for _ in range(self.num_experts)]
@@ -296,9 +306,10 @@ class MixtralSparseMoeBlock(nn.Module):
             device=hidden_states.device,
         )
 
-        # torch.eye()[selected_experts]
-        expert_mask = self.eye[selected_experts].permute(2, 1, 0)
-        # expert_mask = F.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+        eye = torch.eye(self.num_experts).to(selected_experts.device)
+        expert_mask = eye[selected_experts].permute(2, 1, 0)
+
+        #expert_mask = F.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
 
         # Loop over all available experts in the model and perform the computation on each expert
         for expert_idx in range(self.num_experts):
@@ -330,6 +341,71 @@ class MixtralSparseMoeBlock(nn.Module):
             batch_size, sequence_length, hidden_dim
         )
         return final_hidden_states
+
+
+class MixtralAttention(nn.Module):
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        assert config.dim % config.n_head == 0
+
+        total_head_dim = (config.n_head + 2 * config.n_local_heads) * config.head_dim
+        # key, query, value projections for all heads, but in a batch
+        self.wqkv = nn.Linear(config.dim, total_head_dim, bias=False)
+        self.wo = nn.Linear(config.dim, config.dim, bias=False)
+        self.kv_cache = None
+
+        self.n_head = config.n_head
+        self.head_dim = config.head_dim
+        self.n_local_heads = config.n_local_heads
+        self.dim = config.dim
+        self._register_load_state_dict_pre_hook(self.load_hook)
+
+    def load_hook(self, state_dict, prefix, *args):
+        if prefix + "wq.weight" in state_dict:
+            wq = state_dict.pop(prefix + "wq.weight")
+            wk = state_dict.pop(prefix + "wk.weight")
+            wv = state_dict.pop(prefix + "wv.weight")
+            state_dict[prefix + "wqkv.weight"] = torch.cat([wq, wk, wv])
+
+    def forward(
+        self,
+        x: Tensor,
+        freqs_cis: Tensor,
+        mask: Tensor,
+        input_pos: Optional[Tensor] = None,
+    ) -> Tensor:
+        bsz, seqlen, _ = x.shape
+
+        kv_size = self.n_local_heads * self.head_dim
+        q, k, v = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)
+
+        q = q.view(bsz, seqlen, self.n_head, self.head_dim)
+        k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        v = v.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+
+        q = apply_rotary_emb(q, freqs_cis)
+        k = apply_rotary_emb(k, freqs_cis)
+
+        kv_seq_len = k.size(1)
+        use_sliding_windows = (
+            _flash_supports_window_size
+            and getattr(self.config, "sliding_window", None) is not None
+            and kv_seq_len > self.config.sliding_window
+        )
+
+        q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
+
+        if self.kv_cache is not None:
+            k, v = self.kv_cache.update(input_pos, k, v)
+
+        k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+        v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+
+        y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
+
+        y = self.wo(y)
+        return y
 
 
 class Attention(nn.Module):
@@ -468,7 +544,7 @@ class BlockSparseMoE(nn.Module):
         offsets_t = torch.cat([zero, nnz_per_column])
         return column_indices_t, offsets_t, block_offsets_t
 
-    def topology(self, x: torch.Tensor, padded_bins: torch.Tensor) -> stk.Matrix:
+    def topology(self, x: torch.Tensor, padded_bins: torch.Tensor):# -> stk.Matrix:
         padded_tokens, _ = x.size()
         assert padded_tokens % self.blocking == 0
         assert self.ffn_dim_per_partition % self.blocking == 0

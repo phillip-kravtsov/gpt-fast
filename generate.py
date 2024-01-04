@@ -13,6 +13,7 @@ import torch
 import torch._dynamo.config
 import torch._inductor.config
 
+from torch.nn.utils.rnn import pad_sequence
 torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
 torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
@@ -107,55 +108,91 @@ def speculative_decode(
 ) -> torch.Tensor:
     # draft model inference sequentially
     device = cur_token.device
+    batch_size = cur_token.size(0)
     orig_input_pos = torch.tensor(
         [input_pos], dtype=torch.int64, device=cur_token.device
     )
     draft_tokens, draft_probs = decode_n_tokens(
         draft_model,
-        cur_token.view(1, -1),
+        cur_token.view(batch_size, -1),
         orig_input_pos.clone(),
         speculate_k,
         **sampling_kwargs,
-    )
+    ) 
 
-    draft_tokens = torch.cat(draft_tokens)
+    draft_tokens = torch.cat(draft_tokens, dim=1)
+    print(f'{draft_tokens.shape=}')
+    print(f'{draft_tokens[0].shape=}')
     # parallel inference on target model using draft tokens
     target_logits = model_forward(
         model,
-        torch.cat([cur_token.view(1), draft_tokens]).view(1, -1),
+        torch.cat([cur_token.view(batch_size, 1), draft_tokens], dim=1).view(batch_size, -1),
         torch.arange(input_pos, input_pos + speculate_k + 1, device=cur_token.device),
     )
-    target_probs = logits_to_probs(target_logits[0], **sampling_kwargs)
-    draft_probs = torch.stack(draft_probs)
+    print(f'{draft_probs[0].shape=}')
+    print(f'{target_logits.shape=}')
+    target_probs = logits_to_probs(target_logits, **sampling_kwargs)
+    draft_probs = torch.stack(draft_probs, dim=1)
+    print('-'*80)
     # q: target prob, p: draft prob
     # q >= p: always accept draft token
     # q < p: q/p prob to accept draft token
-    p = draft_probs[torch.arange(0, speculate_k, device=device), draft_tokens]
-    q = target_probs[torch.arange(0, speculate_k, device=device), draft_tokens]
-    accept_draft_prob = torch.minimum(torch.ones(()), q[:speculate_k] / p)
-    rejected_locations = (
-        torch.rand_like(accept_draft_prob) > accept_draft_prob
-    ).nonzero()
+    print(f'{draft_probs.shape=}')
+    print(f'{target_probs.shape=}')
+    p = draft_probs[:, torch.arange(0, speculate_k, device=device), draft_tokens]
+    q = target_probs[:, torch.arange(0, speculate_k, device=device), draft_tokens]
+    print(f'{p.shape=}{q.shape=}')
+    accept_draft_prob = torch.minimum(torch.ones(()), q[:,:speculate_k] / p)
+    print(f'{accept_draft_prob.shape=}')
+    for i in range(batch_size):
+        accept_draft_prob_i = accept_draft_prob[i]
+        rejected_locations = (
+            torch.rand_like(accept_draft_prob) > accept_draft_prob
+        ).nonzero()
+        if rejected_locations.shape[0] == 0:
+            accept_length = speculate_k + 1
+            last_token = multinomial_sample_one_no_sync(target_probs[i,-1])
+            model_forward(
+                draft_model,
+                draft_tokens[i, -1].view(1, -1),
+                orig_input_pos + speculate_k,
+            )
+
+    print(f'{rejected_locations.shape=}')
+    print(f'{rejected_locations}')
 
     if rejected_locations.shape[0] == 0:  # All draft tokens have been accepted
         accept_length = speculate_k + 1
-        last_token = multinomial_sample_one_no_sync(target_probs[-1])
+        print(f'{target_probs.shape=}')
+        last_token = multinomial_sample_one_no_sync(target_probs[:,-1])
         # fill last token into draft model
         model_forward(
             draft_model,
-            draft_tokens[-1].view(1, -1),
+            draft_tokens[:, -1].view(batch_size, -1),
             orig_input_pos + speculate_k,
         )
-        return torch.cat([draft_tokens, last_token])
+        print(f'{draft_tokens.shape=}{last_token.shape=}')
+        return torch.cat([draft_tokens, last_token], dim=1)
     else:
-        accept_length = rejected_locations[0].item()
-        p = draft_probs[accept_length]
-        q = target_probs[accept_length]
-        new = q - p
-        new = torch.where(new > 0, new, 0.0)
-        new = new / new.sum()
-        next_token = multinomial_sample_one_no_sync(new)
-        return torch.cat([draft_tokens[:accept_length], next_token])
+        sequences = []
+        print(rejected_locations.shape)
+        for i in range(batch_size):
+            print(rejected_locations[i])
+            accept_length = rejected_locations[i].item()
+            p = draft_probs[i, accept_length]
+            q = target_probs[i, accept_length]
+            new = q - p
+            new = torch.where(new > 0, new, 0.0)
+            new = new / new.sum()
+            next_token = multinomial_sample_one_no_sync(new)
+            sequences.append(
+                torch.cat([draft_tokens[i, :accept_length], next_token])
+            )
+        # realign sequences which are of variable length with left-padding
+        
+        return pad_sequence(
+            [s[::-1] for s in sequences], batch_first=True, padding_value=pad_token
+        )[..., ::-1]
 
 
 @torch.no_grad()
@@ -163,6 +200,7 @@ def generate(
     model: Transformer,
     prompt: torch.Tensor,
     max_new_tokens: int,
+    batch_size: int,
     *,
     interactive: bool,
     draft_model: Transformer,
@@ -173,13 +211,12 @@ def generate(
     """
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
     """
-    batch_size = 4
+    print("Generating")
     prompt = prompt.repeat(batch_size, 1)
     T = prompt.size(1)
 
     is_speculative = draft_model is not None
     # create an empty tensor of the expected final shape and fill in the current tokens
-    T = prompt.size(0)
     T_new = T + max_new_tokens
     if interactive:
         max_seq_length = 350
@@ -201,10 +238,12 @@ def generate(
     seq[:, :T] = prompt
 
     input_pos = torch.arange(0, T, device=device)
+    prefill_start = time.perf_counter()
 
     next_token = prefill(model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs)
     if is_speculative:
         prefill(draft_model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs)
+    prefill_time = time.perf_counter() - prefill_start
     seq[:, T] = next_token.view(-1)
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
@@ -213,19 +252,19 @@ def generate(
     if is_speculative:
         input_pos = input_pos.item()  # for speculative decoding easier to keep on host
         while input_pos < T_new - 1:
-            cur_token = next_token.view(())
+            cur_token = next_token.view(batch_size)
 
             next_tokens = speculative_decode(
                 model, draft_model, cur_token, input_pos, speculate_k, **sampling_kwargs
             )
 
-            accept_counts[len(next_tokens) - 1] += 1
-            num_added = min(T_new - input_pos - 1, len(next_tokens))
-            seq[input_pos + 1 : input_pos + num_added + 1] = next_tokens[:num_added]
-            for i in next_tokens[:num_added,]:
+            accept_counts[len(next_tokens[0]) - 1] += 1
+            num_added = min(T_new - input_pos - 1, len(next_tokens[0]))
+            seq[:, input_pos + 1 : input_pos + num_added + 1] = next_tokens[:, :num_added]
+            for i in next_tokens[:, :num_added]:
                 callback(i)
             input_pos = input_pos + num_added
-            next_token = next_tokens[-1]
+            next_token = next_tokens[:, -1]
     else:
         generated_tokens, _ = decode_n_tokens(
             model,
@@ -237,7 +276,7 @@ def generate(
         )
         seq[:, T + 1 :] = torch.cat(generated_tokens, dim=1)
 
-    generate_stats = {"accept_counts": accept_counts}
+    generate_stats = {"accept_counts": accept_counts, "prefill_time": prefill_time}
     return seq, generate_stats
 
 
@@ -297,10 +336,10 @@ def _load_model(checkpoint_path, device, precision, use_tp):
         model = simple_quantizer.convert_for_runtime()
 
     checkpoint = torch.load(str(checkpoint_path), mmap=True, weights_only=True)
-    model.load_state_dict(checkpoint, assign=True, strict=True)
+    model.load_state_dict(checkpoint, assign=True)
 
     for layer in model.layers:
-        if hasattr(layer.block_sparse_moe, "eye"):
+        if hasattr(layer, 'block_sparse_moe') and hasattr(layer.block_sparse_moe, "eye"):
             layer.block_sparse_moe.eye = torch.eye(8).to(device)
 
     print("loaded state dict.")
@@ -323,6 +362,7 @@ def main(
     interactive: bool = False,
     num_samples: int = 5,
     max_new_tokens: int = 100,
+    batch_size: int = 1,
     top_k: int = 200,
     temperature: float = 0.8,
     checkpoint_path: Path = Path(
@@ -349,7 +389,7 @@ def main(
             # only print on rank 0
             print = lambda *args, **kwargs: None
 
-    device = "cuda"
+    device = "cuda:0"
     precision = torch.bfloat16
     is_speculative = draft_checkpoint_path is not None
     is_chat = "chat" in str(checkpoint_path)
@@ -380,6 +420,7 @@ def main(
     if compile:
         fullgraph = False
         # torch._dynamo.config.capture_dynamic_output_shape_ops = True
+        torch._dynamo.config.cache_size_limit = 512
         if is_speculative and use_tp:
             torch._inductor.config.triton.cudagraph_trees = (
                 False  # Bug with cudagraph trees in this case
@@ -404,6 +445,7 @@ def main(
     aggregate_metrics = {
         "tokens_per_sec": [],
         "accept_counts": [],
+        'prefill_time': [],
     }
     start = -1 if compile else 0
 
@@ -446,6 +488,7 @@ def main(
                 model,
                 encoded,
                 max_new_tokens,
+                batch_size=batch_size,
                 draft_model=draft_model,
                 speculate_k=speculate_k,
                 interactive=interactive,
@@ -454,6 +497,7 @@ def main(
                 top_k=top_k,
             )
             aggregate_metrics["accept_counts"].append(metrics["accept_counts"])
+            aggregate_metrics['prefill_time'].append(metrics['prefill_time'])
         if i == -1:
             print(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
             continue
@@ -469,7 +513,7 @@ def main(
             print(tokenizer.decode(y.tolist()))
         else:
             print()
-        tokens_generated = y.size(0) - prompt_length
+        tokens_generated = y.size(0) * (y.size(1) - prompt_length)
         tokens_sec = tokens_generated / t
         aggregate_metrics["tokens_per_sec"].append(tokens_sec)
         print(
@@ -488,6 +532,12 @@ def main(
     print(
         f"Average tokens/sec: {torch.mean(torch.tensor(aggregate_metrics['tokens_per_sec'])).item():.2f}"
     )
+    print(
+        f"User tok/sec: {(torch.mean(torch.tensor(aggregate_metrics['tokens_per_sec']))/batch_size).item():.2f}"
+    )
+    print(
+        f"Average prefill time: {torch.mean(torch.tensor(aggregate_metrics['prefill_time'])).item():.2f}"
+    )
     print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
 
 
@@ -495,11 +545,34 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Your CLI description.")
+    prompt = """
+    Here's some irrelevant info:
+    Update the input sequences and relevant tensors based on the selected best candidate from the inference results.
+
+    Args:
+    - input_ids (torch.Tensor): Current input token sequences.
+    - candidates (torch.Tensor): Candidate token sequences generated in the current step.
+    - best_candidate (int): Index of the chosen best candidate.
+    - accept_length (int): Length of the accepted candidate sequence.
+    - retrieve_indices (torch.Tensor): Indices to map tree to a cartesian product.
+    - outputs, logits, medusa_logits (torch.Tensor): Model's outputs from the previous inference step.
+    - new_token (int): Counter for the new tokens added during inference.
+    - past_key_values_data (torch.Tensor): Tensor containing past hidden states for the transformer model.
+    - current_length_data (torch.Tensor): Tensor containing the current length of sequences in the batch.
+
+    Returns:
+    - input_ids (torch.Tensor): Updated input token sequences.
+    - logits (torch.Tensor): Updated logits.
+    - medusa_logits (torch.Tensor): Updated medusa logits.
+    - new_token (int): Updated counter for the new tokens added.
+
+    Now ignore that and write a quicksort in C++ three times in a row.
+    """
 
     parser.add_argument(
         "--prompt",
         type=str,
-        default="[INST] Write a quicksort in python. [/INST]",
+        default=f"[INST]{prompt}[/INST]",
         help="Input prompt.",
     )
     parser.add_argument(
@@ -509,7 +582,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--num_samples", type=int, default=1, help="Number of samples.")
     parser.add_argument(
-        "--max_new_tokens", type=int, default=20, help="Maximum number of new tokens."
+        "--max_new_tokens", type=int, default=200, help="Maximum number of new tokens."
     )
     parser.add_argument("--top_k", type=int, default=200, help="Top-k for sampling.")
     parser.add_argument(
@@ -539,19 +612,25 @@ if __name__ == "__main__":
         default=None,
         help="Draft checkpoint path.",
     )
+    parser.add_argument(
+        '--batch_size',
+        type=int,
+        default=4
+    )
 
     args = parser.parse_args()
     main(
-        args.prompt,
-        args.interactive,
-        args.num_samples,
-        args.max_new_tokens,
-        args.top_k,
-        args.temperature,
-        args.checkpoint_path,
-        args.compile,
-        args.compile_prefill,
-        args.profile,
-        args.draft_checkpoint_path,
-        args.speculate_k,
+        prompt=args.prompt,
+        interactive=args.interactive,
+        num_samples=args.num_samples,
+        max_new_tokens=args.max_new_tokens,
+        top_k=args.top_k,
+        batch_size=args.batch_size,
+        temperature=args.temperature,
+        checkpoint_path=args.checkpoint_path,
+        compile=args.compile,
+        compile_prefill=args.compile_prefill,
+        profile=args.profile,
+        draft_checkpoint_path=args.draft_checkpoint_path,
+        speculate_k=args.speculate_k,
     )

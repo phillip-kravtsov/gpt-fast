@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 import time
 from pathlib import Path
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
@@ -16,7 +17,7 @@ try:
 except:
     pass
 
-from model import BlockSparseMoE
+from model import Transformer, BlockSparseMoE
 
 ##### Quantization Primitives ######
 
@@ -337,7 +338,7 @@ class WeightOnlyInt8QuantHandler:
     @torch.no_grad()
     def create_quantized_state_dict(self):
         cur_state_dict = self.mod.state_dict()
-        for fqn, mod in self.mod.named_modules():
+        for fqn, mod in tqdm(self.mod.named_modules()):
             if isinstance(mod, torch.nn.Linear):
                 int8_weight, scales, _ = dynamically_quantize_per_channel(
                     mod.weight.float(), -128, 127, torch.int8
@@ -717,7 +718,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint_path",
         type=Path,
-        default=Path("checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth"),
+        required=True,
         help="Path to the model checkpoint to be quantized.",
     )
     parser.add_argument(
