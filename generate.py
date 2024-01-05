@@ -85,7 +85,7 @@ def decode_n_tokens(
     **sampling_kwargs,
 ):
     new_tokens, new_probs = [], []
-    model_time = [] 
+    model_time = []
     for i in range(num_new_tokens):
         with torch.backends.cuda.sdp_kernel(
             enable_flash=False, enable_mem_efficient=False, enable_math=True
@@ -154,7 +154,6 @@ def speculative_decode(
 
     target_probs = logits_to_probs(target_logits, **sampling_kwargs)
     draft_probs = torch.stack(draft_probs, dim=1)
-    # print('-'*80)
     # q: target prob, p: draft prob
     # q >= p: always accept draft token
     # q < p: q/p prob to accept draft token
@@ -166,15 +165,9 @@ def speculative_decode(
     )
 
     p = draft_probs[batch_indices, sequence_indices, draft_tokens]
-
-    # draft_probs += torch.randn_like(draft_probs)
-    # draft_probs = torch.softmax(draft_probs, dim=-1)
-
     q = target_probs[batch_indices, sequence_indices, draft_tokens]
 
-    # print(f'{p.shape=}{q.shape=}')
     accept_draft_prob = torch.minimum(torch.ones(()), q / p)
-    # print(f'{accept_draft_prob.shape=}')
     sequences = []
     for i in range(batch_size):
         rejected_locations = (
@@ -183,7 +176,6 @@ def speculative_decode(
         if rejected_locations.shape[0] == 0:
             accept_length = speculate_k + 1
             last_token = multinomial_sample_one_no_sync(target_probs[i, -1])
-            # print(draft_tokens[i,-1].view(1,-1))
             model_forward(
                 draft_model,
                 draft_tokens[i, -1].view(1, -1),
@@ -192,7 +184,6 @@ def speculative_decode(
             )
             sequences.append(torch.cat([draft_tokens[i], last_token]))
         else:
-            # print(rejected_locations)
             accept_length = rejected_locations[0].item()
             p = draft_probs[i, accept_length]
             q = target_probs[i, accept_length]
@@ -201,15 +192,6 @@ def speculative_decode(
             new = new / new.sum()
             next_token = multinomial_sample_one_no_sync(new)
             sequences.append(torch.cat([draft_tokens[i, :accept_length], next_token]))
-    """
-    max_seq_len = max([s.size(0) for s in sequences])
-    result = torch.full((len(sequences), max_seq_len), -1, dtype=torch.long, device=device)
-    for i in range(batch_size):
-        offset = max_seq_len - sequences[i].size(0)
-        result[i, offset:] = sequences[i]
-    attention_mask = result.ne(-1)
-    result[~attention_mask] = PAD_TOKEN_ID
-    """
     return sequences, start_event.elapsed_time(end_event)
 
 
@@ -274,7 +256,6 @@ def generate(
     model_times = []
 
     if is_speculative:
-        # input_pos = input_pos.tolist()  # for speculative decoding easier to keep on host
         while max(input_pos) < T_new - 1:
             cur_token = next_token.view(batch_size)
             next_token_sequences, speculative_time = speculative_decode(
@@ -290,11 +271,6 @@ def generate(
                     :num_added
                 ]
                 input_pos[i] += num_added
-            """
-            seq[:, input_pos + 1 : input_pos + num_added + 1] = next_tokens[:, :num_added]
-            for i in next_tokens[:, :num_added]:
-                callback(i)
-            """
             next_token = torch.cat(
                 [sequence[-1].unsqueeze(0) for sequence in next_token_sequences]
             )
@@ -317,7 +293,6 @@ def generate(
     }
     trimmed_sequences = []
     for s, ip in zip(seq.tolist(), input_pos.tolist()):
-        print(ip)
         trimmed_sequences.append(s[: ip[0]])
     return trimmed_sequences, generate_stats
 
@@ -519,7 +494,6 @@ def main(
                 if len(buffer) == 4 or done_generating:
                     print("".join(buffer), end="", flush=True)
                     buffer.clear()
-                # print(, end='', flush=True)
         else:
             callback = lambda x: x
         t0 = time.perf_counter()
@@ -543,7 +517,6 @@ def main(
                 temperature=temperature,
                 top_k=top_k,
             )
-            # print('metrics/accept-counts', metrics['accept_counts'])
         if i == -1:
             print(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
             continue
@@ -558,7 +531,6 @@ def main(
         if not interactive:
             sequences = tokenizer.decode(y)
             for sequence in sequences:
-                print(len(sequence))
                 print(sequence)
         else:
             for y_i in y:
@@ -566,7 +538,7 @@ def main(
         aggregate_metrics["accept_counts"].append(metrics["accept_counts"])
         aggregate_metrics["prefill_time"].append(metrics["prefill_time"])
         aggregate_metrics["speculative_times"].extend(metrics["speculative_times"])
-        aggregate_metrics['model_times'].extend(metrics['model_times'])
+        aggregate_metrics["model_times"].extend(metrics["model_times"])
         tokens_generated = sum(len(y_i) - prompt_length for y_i in y)
         tokens_sec = tokens_generated / t
         aggregate_metrics["tokens_generated"].append(tokens_generated)
@@ -575,6 +547,7 @@ def main(
             f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_sec:.02f} tokens/sec"
         )
         print(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
+
     print("==========")
     avg_tokens_generated = sum(aggregate_metrics["tokens_generated"]) / num_samples
     print(f"Average tokens generated: {avg_tokens_generated}")
@@ -606,7 +579,7 @@ def main(
             aggregate_metrics["speculative_times"]
         ).mean()
     else:
-        report['model_time_mean'] = np.array(aggregate_metrics['model_times']).mean()
+        report["model_time_mean"] = np.array(aggregate_metrics["model_times"]).mean()
 
     tok_s = torch.mean(torch.tensor(aggregate_metrics["tokens_per_sec"])).item()
     user_tok_s = (
@@ -614,6 +587,7 @@ def main(
     ).item()
     report["tok_s"] = tok_s
     report["user_tok_s"] = user_tok_s
+
     with open(REPORT_PATH, "a") as f:
         json.dump(report, f)
         f.write("\n")
