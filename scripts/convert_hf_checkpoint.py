@@ -40,7 +40,7 @@ def convert_hf_checkpoint(
             bin_index = json.load(json_map)
         bin_files = {checkpoint_dir / bin for bin in bin_index["weight_map"].values()}
     else:
-        bin_files = {checkpoint_dir / 'pytorch_model.bin'}
+        bin_files = {checkpoint_dir / "pytorch_model.bin"}
 
     weight_map = {
         "model.embed_tokens.weight": "tok_embeddings.weight",
@@ -71,7 +71,8 @@ def convert_hf_checkpoint(
     merged_result = {}
     for file in sorted(bin_files):
         from safetensors.torch import load_file
-        if str(file).endswith('safetensors'):
+
+        if str(file).endswith("safetensors"):
             state_dict = load_file(str(file), device="cpu")
         else:
             print(str(file))

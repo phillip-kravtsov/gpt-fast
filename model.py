@@ -81,6 +81,7 @@ class ModelArgs:
         assert len(config) == 1, name
         return cls(**transformer_configs[config[0]])
 
+
 transformer_configs = {
     "CodeLlama-7b-Python-hf": dict(
         block_size=16384, vocab_size=32000, n_layer=32, dim=4096, rope_base=1000000
@@ -141,7 +142,7 @@ class KVCache(nn.Module):
         # model.forward(input_pos, attention_mask, kv_caches=KVCaches)
         # slice = KVCaches.get(i)
         # Or keep as is and update input pos
-        assert input_pos.shape[1] == k_val.shape[2], f'{input_pos.shape}, {k_val.shape}'
+        assert input_pos.shape[1] == k_val.shape[2], f"{input_pos.shape}, {k_val.shape}"
 
         k_out = self.k_cache
         v_out = self.v_cache
@@ -149,7 +150,9 @@ class KVCache(nn.Module):
         if batch_index is not None:
             k_out[batch_index, :, input_pos.squeeze(0)] = k_val
             v_out[batch_index, :, input_pos.squeeze(0)] = v_val
-            return k_out[batch_index:batch_index+1], v_out[batch_index:batch_index+1]
+            return k_out[batch_index : batch_index + 1], v_out[
+                batch_index : batch_index + 1
+            ]
         else:
             # input_pos is of shape (B, T)
             # kv_val is (B, NH, T, H)
@@ -160,7 +163,6 @@ class KVCache(nn.Module):
                 k_out[i, :, input_pos[i]] = k_val[i]
                 v_out[i, :, input_pos[i]] = v_val[i]
             return k_out, v_out
-
 
 
 class Transformer(nn.Module):
@@ -205,10 +207,12 @@ class Transformer(nn.Module):
             torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool)
         )
 
-    def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None, batch_index=None) -> Tensor:
+    def forward(
+        self, idx: Tensor, input_pos: Optional[Tensor] = None, batch_index=None
+    ) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
         mask = self.causal_mask[input_pos]
-        mask = mask[:,None,:,:]
+        mask = mask[:, None, :, :]
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
 
@@ -232,9 +236,16 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(config.dim, config.norm_eps)
 
     def forward(
-        self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor, batch_index,
+        self,
+        x: Tensor,
+        input_pos: Tensor,
+        freqs_cis: Tensor,
+        mask: Tensor,
+        batch_index,
     ) -> Tensor:
-        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos, batch_index)
+        h = x + self.attention(
+            self.attention_norm(x), freqs_cis, mask, input_pos, batch_index
+        )
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -243,7 +254,7 @@ class MixtralBlock(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
         super().__init__()
         self.attention = Attention(config)
-        #self.block_sparse_moe = BlockSparseMoE(config)
+        # self.block_sparse_moe = BlockSparseMoE(config)
         self.block_sparse_moe = MixtralSparseMoeBlock(config)
         self.attention_norm = RMSNorm(config.dim, config.norm_eps)
         self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
@@ -265,7 +276,7 @@ class MixtralSparseMoeBlock(nn.Module):
         self.top_k = config.num_experts_per_tok
         assert self.num_experts is not None and self.top_k is not None
         self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
-        #self.register_buffer("eye", torch.eye(self.num_experts))
+        # self.register_buffer("eye", torch.eye(self.num_experts))
 
         self.experts = nn.ModuleList(
             [FeedForward(config) for _ in range(self.num_experts)]
@@ -295,7 +306,7 @@ class MixtralSparseMoeBlock(nn.Module):
         eye = torch.eye(self.num_experts).to(selected_experts.device)
         expert_mask = eye[selected_experts].permute(2, 1, 0)
 
-        #expert_mask = F.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+        # expert_mask = F.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
 
         # Loop over all available experts in the model and perform the computation on each expert
         for expert_idx in range(self.num_experts):
@@ -423,7 +434,7 @@ class Attention(nn.Module):
         freqs_cis: Tensor,
         mask: Tensor,
         input_pos: Optional[Tensor] = None,
-        batch_index = None,
+        batch_index=None,
     ) -> Tensor:
         bsz, seqlen, _ = x.shape
 
@@ -442,10 +453,10 @@ class Attention(nn.Module):
         if self.kv_cache is not None:
             k, v = self.kv_cache.update(input_pos, k, v, batch_index)
 
-        #print(f"After cache, k shape: {k.shape}, v shape: {v.shape}")
+        # print(f"After cache, k shape: {k.shape}, v shape: {v.shape}")
         k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-        #print(f"Pre-SDPA, k shape: {k.shape}, v shape: {v.shape} mask shape {mask.shape}")
+        # print(f"Pre-SDPA, k shape: {k.shape}, v shape: {v.shape} mask shape {mask.shape}")
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
@@ -532,7 +543,7 @@ class BlockSparseMoE(nn.Module):
         offsets_t = torch.cat([zero, nnz_per_column])
         return column_indices_t, offsets_t, block_offsets_t
 
-    def topology(self, x: torch.Tensor, padded_bins: torch.Tensor):# -> stk.Matrix:
+    def topology(self, x: torch.Tensor, padded_bins: torch.Tensor):  # -> stk.Matrix:
         padded_tokens, _ = x.size()
         assert padded_tokens % self.blocking == 0
         assert self.ffn_dim_per_partition % self.blocking == 0

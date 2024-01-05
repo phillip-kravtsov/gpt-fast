@@ -354,7 +354,6 @@ class WeightOnlyInt8QuantHandler:
                 cur_state_dict[f"{fqn}.scales"] = scales.to(mod.weight.dtype)
             """
 
-
         return cur_state_dict
 
     def convert_for_runtime(self):

@@ -19,7 +19,7 @@ def hf_download(repo_id: Optional[str] = None, hf_token: Optional[str] = None) -
             cache_dir="/workspace/.cache",
             local_dir=f"checkpoints/{repo_id}",
             local_dir_use_symlinks=False,
-            use_auth_token='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',
+            use_auth_token="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",
         )
     except HTTPError as e:
         if e.response.status_code == 401:
