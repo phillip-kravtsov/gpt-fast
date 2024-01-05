@@ -86,6 +86,15 @@ transformer_configs = {
     "CodeLlama-7b-Python-hf": dict(
         block_size=16384, vocab_size=32000, n_layer=32, dim=4096, rope_base=1000000
     ),
+    "TinyLlama-1.1B-Chat-v1.0": dict(
+        block_size=2048,
+        vocab_size=32000,
+        dim=2048,
+        n_layer=22,
+        n_head=32,
+        n_local_heads=4,
+        intermediate_size=5632,
+    ),
     "TinyLlama-1.1B-intermediate-step-480k-1T": dict(
         block_size=2048,
         vocab_size=32000,

@@ -40,7 +40,10 @@ def convert_hf_checkpoint(
             bin_index = json.load(json_map)
         bin_files = {checkpoint_dir / bin for bin in bin_index["weight_map"].values()}
     else:
-        bin_files = {checkpoint_dir / "pytorch_model.bin"}
+        if (checkpoint_dir / "pytorch_model.bin").is_file():
+            bin_files = {checkpoint_dir / "pytorch_model.bin"}
+        else:
+            bin_files = {checkpoint_dir / "model.safetensors"}
 
     weight_map = {
         "model.embed_tokens.weight": "tok_embeddings.weight",

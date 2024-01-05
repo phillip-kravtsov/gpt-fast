@@ -33,6 +33,7 @@ from tp import maybe_init_dist
 
 PAD_TOKEN_ID = 1
 REPORT_PATH = "output.jsonl"
+RECORD_EVENTS = True
 
 
 def multinomial_sample_one_no_sync(
@@ -88,7 +89,7 @@ def decode_n_tokens(
     model_time = []
     for i in range(num_new_tokens):
         with torch.backends.cuda.sdp_kernel(
-            enable_flash=False, enable_mem_efficient=False, enable_math=True
+            enable_flash=True, enable_mem_efficient=False, enable_math=True
         ):  # Actually better for Inductor to codegen attention here
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
@@ -97,8 +98,9 @@ def decode_n_tokens(
                 model, cur_token, input_pos, **sampling_kwargs
             )
             end_event.record()
-            torch.cuda.synchronize()
-            model_time.append(start_event.elapsed_time(end_event))
+            if RECORD_EVENTS:
+                torch.cuda.synchronize()
+                model_time.append(start_event.elapsed_time(end_event))
         input_pos += 1
         new_tokens.append(next_token.clone())
         callback(new_tokens[-1])
@@ -140,17 +142,25 @@ def speculative_decode(
     # parallel inference on target model using draft tokens
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
+    draft_token_inputs = torch.cat(
+        [cur_token.view(batch_size, 1), draft_tokens], dim=1
+    ).view(batch_size, -1)
+    input_pos_inputs = input_pos + torch.arange(
+        speculate_k + 1, device=input_pos.device
+    )
+
     start_event.record()
     target_logits = model_forward(
         model,
-        torch.cat([cur_token.view(batch_size, 1), draft_tokens], dim=1).view(
-            batch_size, -1
-        ),
-        input_pos + torch.arange(speculate_k + 1, device=input_pos.device),
+        draft_token_inputs,
+        input_pos_inputs,
         None,
     )
     end_event.record()
-    torch.cuda.synchronize()
+    speculate_time = 0.0
+    if RECORD_EVENTS:
+        torch.cuda.synchronize()
+        speculate_time = start_event.elapsed_time(end_event)
 
     target_probs = logits_to_probs(target_logits, **sampling_kwargs)
     draft_probs = torch.stack(draft_probs, dim=1)
@@ -192,7 +202,7 @@ def speculative_decode(
             new = new / new.sum()
             next_token = multinomial_sample_one_no_sync(new)
             sequences.append(torch.cat([draft_tokens[i, :accept_length], next_token]))
-    return sequences, start_event.elapsed_time(end_event)
+    return sequences, speculate_time
 
 
 @torch.no_grad()
@@ -535,6 +545,7 @@ def main(
         else:
             for y_i in y:
                 print(tokenizer.decode(y_i))
+
         aggregate_metrics["accept_counts"].append(metrics["accept_counts"])
         aggregate_metrics["prefill_time"].append(metrics["prefill_time"])
         aggregate_metrics["speculative_times"].extend(metrics["speculative_times"])
