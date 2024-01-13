@@ -89,7 +89,7 @@ def decode_n_tokens(
     model_time = []
     for i in range(num_new_tokens):
         with torch.backends.cuda.sdp_kernel(
-            enable_flash=True, enable_mem_efficient=False, enable_math=True
+            enable_flash=False, enable_mem_efficient=False, enable_math=True,
         ):  # Actually better for Inductor to codegen attention here
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
