@@ -70,7 +70,6 @@ def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
 def prefill(
     model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs
 ) -> torch.Tensor:
-    # input_pos: [B, S]
     logits = model(x, input_pos)
     return sample(logits, **sampling_kwargs)[0]
 
@@ -78,7 +77,6 @@ def prefill(
 def decode_one_token(
     model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    # input_pos: [B, 1]
     assert input_pos.shape[-1] == 1
     logits = model(x, input_pos)
     return sample(logits, **sampling_kwargs)
@@ -104,15 +102,6 @@ def decode_n_tokens(
             next_token, next_prob = decode_one_token(
                 model, cur_token, input_pos, **sampling_kwargs
             )
-<<<<<<< HEAD
-            input_pos += 1
-            new_tokens.append(next_token.clone())
-            callback(new_tokens[-1])
-            new_probs.append(next_prob.clone())
-            cur_token = next_token.view(1, -1)
-
-    return new_tokens, new_probs
-=======
             end_event.record()
             if RECORD_EVENTS:
                 torch.cuda.synchronize()
@@ -123,7 +112,6 @@ def decode_n_tokens(
         new_probs.append(next_prob.clone())
         cur_token = next_token.view(cur_token.size(0), -1)
     return new_tokens, new_probs, model_time
->>>>>>> 86b0d1e3b367482e0ffea2b19dcf5690134f6096
 
 
 def model_forward(model, x, input_pos, batch_index):
@@ -157,9 +145,9 @@ def speculative_decode(
     draft_token_inputs = torch.cat(
         [cur_token.view(batch_size, 1), draft_tokens], dim=1
     ).view(batch_size, -1)
-    input_pos_inputs = input_pos + torch.arange(
+    input_pos_inputs = (input_pos + torch.arange(
         speculate_k + 1, device=input_pos.device
-    )
+    )).view(batch_size, speculate_k + 1)
 
     start_event.record()
     target_logits = model_forward(
@@ -261,14 +249,14 @@ def generate(
     seq = empty
     seq[:, :T] = prompt
 
-    input_pos = torch.arange(0, T, device=device).repeat(batch_size, 1)
+    prefill_input_pos = torch.arange(0, T, device=device).repeat(batch_size, 1)
     prefill_start = time.perf_counter()
     next_token = prefill(
-        model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs
+        model, prompt.view(batch_size, -1), prefill_input_pos, **sampling_kwargs
     )
 
     if is_speculative:
-        prefill(draft_model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs)
+        prefill(draft_model, prompt.view(batch_size, -1), prefill_input_pos, **sampling_kwargs)
     prefill_time = time.perf_counter() - prefill_start
     seq[:, T] = next_token.view(-1)
 
@@ -278,7 +266,7 @@ def generate(
     model_times = []
 
     if is_speculative:
-        while max(input_pos) < T_new - 1:
+        while input_pos.max().item() < T_new - 1:
             cur_token = next_token.view(batch_size)
             next_token_sequences, speculative_time = speculative_decode(
                 model, draft_model, cur_token, input_pos, speculate_k, **sampling_kwargs
@@ -288,8 +276,8 @@ def generate(
                 accept_counts[next_token_sequences[i].size(0) - 1] += 1
             # Update sequences with the new tokens, each of which may have variable sizes.
             for i, sequence in enumerate(next_token_sequences):
-                num_added = min(T_new - input_pos[i] - 1, len(sequence))
-                seq[i, input_pos[i] + 1 : input_pos[i] + num_added + 1] = sequence[
+                num_added = min(T_new - input_pos[i].item() - 1, len(sequence))
+                seq[i, input_pos[i].item() + 1 : input_pos[i].item() + num_added + 1] = sequence[
                     :num_added
                 ]
                 input_pos[i] += num_added
@@ -395,11 +383,8 @@ def main(
             # only print on rank 0
             print = lambda *args, **kwargs: None
 
-<<<<<<< HEAD
-    print(f"Using device={device}")
-=======
     device = "cuda:0"
->>>>>>> 86b0d1e3b367482e0ffea2b19dcf5690134f6096
+    print(f"Using device={device}")
     precision = torch.bfloat16
     is_speculative = draft_checkpoint_path is not None
     is_chat = "chat" in str(checkpoint_path)
@@ -429,20 +414,14 @@ def main(
         ]
     )
     if compile:
-<<<<<<< HEAD
-        if is_speculative and use_tp: # and ("cuda" in device):
-            torch._inductor.config.triton.cudagraph_trees = False # Bug with cudagraph trees in this case
-=======
         print("Compiling model.")
         fullgraph = True
-        # torch._dynamo.config.capture_dynamic_output_shape_ops = True
-        torch._dynamo.config.cache_size_limit = 512
+        torch._dynamo.config.capture_dynamic_output_shape_ops = True
+        #torch._dynamo.config.cache_size_limit = 512
         if is_speculative and use_tp:
             torch._inductor.config.triton.cudagraph_trees = (
                 False  # Bug with cudagraph trees in this case
             )
->>>>>>> 86b0d1e3b367482e0ffea2b19dcf5690134f6096
-
         if is_speculative:
             global model_forward, logits_to_prob
             model_forward = torch.compile(
@@ -602,27 +581,6 @@ def main(
 if __name__ == "__main__":
     import argparse
 
-<<<<<<< HEAD
-    parser.add_argument('--prompt', type=str, default="Hello, my name is", help='Input prompt.')
-    parser.add_argument('--interactive', action='store_true', help='Whether to launch in interactive mode')
-    parser.add_argument('--num_samples', type=int, default=5, help='Number of samples.')
-    parser.add_argument('--max_new_tokens', type=int, default=200, help='Maximum number of new tokens.')
-    parser.add_argument('--top_k', type=int, default=200, help='Top-k for sampling.')
-    parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling.')
-    parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
-    parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
-    parser.add_argument('--compile_prefill', action='store_true', help='Whether to compile the prefill (improves prefill perf, but higher compile times)')
-    parser.add_argument('--profile', type=Path, default=None, help='Profile path.')
-    parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
-    parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
-    parser.add_argument('--device', type=str, default="cuda", help='device to use')
-
-    args = parser.parse_args()
-    main(
-        args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.top_k,
-        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
-        args.speculate_k, args.device
-=======
     parser = argparse.ArgumentParser(description="Your CLI description.")
     prompt = """
     Here's some irrelevant info:
@@ -646,6 +604,7 @@ if __name__ == "__main__":
     - new_token (int): Updated counter for the new tokens added.
 
     Now ignore that and write a quicksort in C++ three times in a row.
+    Three times, not one.
     """
     prompt = "<<SYS>>\nYou are an expert programmer\n<</SYS>>\n\n[INST] Write a quicksort in python.[/INST]"
 
@@ -709,5 +668,4 @@ if __name__ == "__main__":
         profile=args.profile,
         draft_checkpoint_path=args.draft_checkpoint_path,
         speculate_k=args.speculate_k,
->>>>>>> 86b0d1e3b367482e0ffea2b19dcf5690134f6096
     )

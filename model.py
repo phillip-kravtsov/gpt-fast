@@ -83,6 +83,15 @@ transformer_configs = {
         n_local_heads=4,
         intermediate_size=5632,
     ),
+    "mistral-instruct-tinyllama-draft": dict(
+        block_size=2048,
+        vocab_size=32000,
+        dim=2048,
+        n_layer=22,
+        n_head=32,
+        n_local_heads=4,
+        intermediate_size=5632,
+    ),
     "7B": dict(n_layer=32, n_head=32, dim=4096),
     "13B": dict(n_layer=40, n_head=40, dim=5120),
     "30B": dict(n_layer=60, n_head=52, dim=6656),
@@ -98,7 +107,44 @@ transformer_configs = {
     "70B": dict(
         n_layer=80, n_head=64, dim=8192, n_local_heads=8, intermediate_size=28672
     ),
+    "Mistral-7B-Instruct-v0.1": dict(
+        block_size=4096,
+        vocab_size=32000,
+        dim=4096,
+        n_layer=32,
+        n_head=32,
+        n_local_heads=8,
+        intermediate_size=14336,
+        rope_base=10000,
+    )
 }
+"""
+Mistral config:
+{
+  "architectures": [
+    "MistralForCausalLM"
+  ],
+  "bos_token_id": 1,
+  "eos_token_id": 2,
+  "hidden_act": "silu",
+  "hidden_size": 4096,
+  "initializer_range": 0.02,
+  "intermediate_size": 14336,
+  "max_position_embeddings": 32768,
+  "model_type": "mistral",
+  "num_attention_heads": 32,
+  "num_hidden_layers": 32,
+  "num_key_value_heads": 8,
+  "rms_norm_eps": 1e-05,
+  "rope_theta": 10000.0,
+  "sliding_window": 4096,
+  "tie_word_embeddings": false,
+  "torch_dtype": "bfloat16",
+  "transformers_version": "4.34.0.dev0",
+  "use_cache": true,
+  "vocab_size": 32000
+}
+"""
 
 
 class KVCache(nn.Module):
