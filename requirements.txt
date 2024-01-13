@@ -1,2 +1,2 @@
-torch
+torch --index-url https://download.pytorch.org/whl/nightly/cu121
 sentencepiece

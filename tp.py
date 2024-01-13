@@ -11,23 +11,34 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed import _functional_collectives as funcol
 
-from model import Attention, FeedForward, Transformer
+from model import (
+    Attention,
+    FeedForward,
+    Transformer,
+    MixtralSparseMoeBlock,
+    MixtralBlock,
+    BlockSparseMoE,
+)
 from quantize import WeightOnlyInt4Linear
 
 
 def _get_rank() -> int:
     return int(os.environ.get("LOCAL_RANK", "0"))
 
+
 def is_local():
     return _get_rank() == 0
+
 
 def local_break():
     if is_local():
         breakpoint()
     dist.barrier()
 
+
 def _get_world_size() -> int:
     return int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+
 
 def maybe_init_dist() -> Optional[int]:
     try:
@@ -46,21 +57,21 @@ def maybe_init_dist() -> Optional[int]:
     return rank
 
 
-def _apply_tp_linear(linear: nn.Linear, style: str, weight_splits: List[int] = []) -> None:
+def _apply_tp_linear(
+    linear: nn.Linear, style: str, weight_splits: List[int] = []
+) -> None:
     rank = _get_rank()
     world_size = _get_world_size()
 
     # Linear's weight matrix is transposed, and is of shape
     # (linear.out_features, linear.in_features)
-    dim_lookup = {
-        "colwise": (0, "out_features"),
-        "rowwise": (1, "in_features")
-    }
+    dim_lookup = {"colwise": (0, "out_features"), "rowwise": (1, "in_features")}
     assert style in dim_lookup
     shard_dim, size_attr = dim_lookup[style]
 
     # ensure we can shard evenly
     assert getattr(linear, size_attr) % world_size == 0
+
     def shard(x, dim):
         assert x.size(dim=dim) % world_size == 0
         return torch.tensor_split(x, world_size, dim=dim)[rank]
@@ -70,7 +81,7 @@ def _apply_tp_linear(linear: nn.Linear, style: str, weight_splits: List[int] = [
         q = shard(q, dim)
         k = shard(k, dim)
         v = shard(v, dim)
-        return torch.cat((q,k,v), dim=dim)
+        return torch.cat((q, k, v), dim=dim)
 
     # shard
     if weight_splits:
@@ -78,8 +89,12 @@ def _apply_tp_linear(linear: nn.Linear, style: str, weight_splits: List[int] = [
         assert len(weight_splits) == 3
 
         if isinstance(linear, WeightOnlyInt4Linear):
-            sharded_weight = shard_qkv(linear.weight, shard_dim, [i//8 for i in weight_splits])
-            linear.scales_and_zeros = shard_qkv(linear.scales_and_zeros, 1 - shard_dim, weight_splits)
+            sharded_weight = shard_qkv(
+                linear.weight, shard_dim, [i // 8 for i in weight_splits]
+            )
+            linear.scales_and_zeros = shard_qkv(
+                linear.scales_and_zeros, 1 - shard_dim, weight_splits
+            )
         else:
             sharded_weight = shard_qkv(linear.weight, shard_dim, weight_splits)
         if hasattr(linear, "scales") and style == "colwise":
@@ -89,7 +104,12 @@ def _apply_tp_linear(linear: nn.Linear, style: str, weight_splits: List[int] = [
         if isinstance(linear, WeightOnlyInt4Linear):
             linear.scales_and_zeros = shard(linear.scales_and_zeros, 1 - shard_dim)
             if style == "rowwise":
-                assert linear.scales_and_zeros.shape[0] * 32 == sharded_weight.shape[1] * sharded_weight.shape[2] * sharded_weight.shape[3]
+                assert (
+                    linear.scales_and_zeros.shape[0] * 32
+                    == sharded_weight.shape[1]
+                    * sharded_weight.shape[2]
+                    * sharded_weight.shape[3]
+                )
                 assert linear.scales_and_zeros.shape[1] == sharded_weight.shape[0] * 8
         if hasattr(linear, "scales") and style == "colwise":
             linear.scales = shard(linear.scales, 0)
@@ -112,8 +132,11 @@ def _apply_tp_ffn(mlp: FeedForward) -> None:
     _apply_tp_linear(mlp.w2, "rowwise")
 
     world_size = _get_world_size()
-    mlp.register_forward_hook(lambda _module, _input, output: funcol.all_reduce(
-        output, "sum", list(range(world_size))))
+    mlp.register_forward_hook(
+        lambda _module, _input, output: funcol.all_reduce(
+            output, "sum", list(range(world_size))
+        )
+    )
 
 
 def _apply_tp_attn(attn: Attention) -> None:
@@ -131,8 +154,11 @@ def _apply_tp_attn(attn: Attention) -> None:
     attn.head_dim = attn.dim // attn.n_head
     attn.n_local_heads = attn.n_local_heads // world_size
 
-    attn.register_forward_hook(lambda _module, _input, output: funcol.all_reduce(
-        output[0], "sum", list(range(world_size))))
+    attn.register_forward_hook(
+        lambda _module, _input, output: funcol.all_reduce(
+            output[0], "sum", list(range(world_size))
+        )
+    )
 
 
 def _apply_tp_Transformer(Transformer: Transformer) -> None:
@@ -143,9 +169,41 @@ def _apply_tp_Transformer(Transformer: Transformer) -> None:
     Transformer.config.n_local_heads = Transformer.config.n_local_heads // world_size
 
 
+def _apply_tp_mixtral_ffn(mlp: MixtralSparseMoeBlock):
+    for expert in mlp.experts:
+        _apply_tp_ffn(expert)
+
+
+def _apply_tp_mixtral_mb_linear(w, shard_size, ffn_dim, hidden_dim, num_experts):
+    weight = w.view(num_experts, ffn_dim, -1)
+    rank = _get_rank()
+    weight = weight[:, shard_size * rank : shard_size * (rank + 1)]
+    weight = weight.reshape(shard_size * num_experts, hidden_dim)
+    return torch.nn.Parameter(weight, requires_grad=False)
+
+
+def _apply_tp_mixtral_mb(mlp: BlockSparseMoE):
+    mlp.ffn_dim_per_partition = mlp.ffn_dim // _get_world_size()
+    mlp.w1 = _apply_tp_mixtral_mb_linear(
+        mlp.w1, mlp.ffn_dim_per_partition, mlp.ffn_dim, mlp.hidden_dim, mlp.num_experts
+    )
+    mlp.w2 = _apply_tp_mixtral_mb_linear(
+        mlp.w2, mlp.ffn_dim_per_partition, mlp.ffn_dim, mlp.hidden_dim, mlp.num_experts
+    )
+    mlp.w3 = _apply_tp_mixtral_mb_linear(
+        mlp.w3, mlp.ffn_dim_per_partition, mlp.ffn_dim, mlp.hidden_dim, mlp.num_experts
+    )
+
+
 def apply_tp(model: Transformer) -> None:
     _apply_tp_Transformer(model)
     for block in model.layers:
         # Apply to MLP
-        _apply_tp_ffn(block.feed_forward)
+        if isinstance(block, MixtralBlock):
+            if isinstance(block.block_sparse_moe, MixtralSparseMoeBlock):
+                _apply_tp_mixtral_ffn(block.block_sparse_moe)
+            else:
+                _apply_tp_mixtral_mb(block.block_sparse_moe)
+        else:
+            _apply_tp_ffn(block.feed_forward)
         _apply_tp_attn(block.attention)
