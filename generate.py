@@ -7,7 +7,7 @@ import itertools
 import sys
 import time
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 import json
 import numpy as np
 
@@ -15,7 +15,6 @@ import torch
 import torch._dynamo.config
 import torch._inductor.config
 
-from torch.nn.utils.rnn import pad_sequence
 
 torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
@@ -28,7 +27,7 @@ sys.path.append(str(wd))
 
 from sentencepiece import SentencePieceProcessor
 
-from model import Transformer, MixtralBlock
+from model import Transformer
 from tp import maybe_init_dist
 
 PAD_TOKEN_ID = 1
@@ -125,11 +124,6 @@ def speculative_decode(
     device = cur_token.device
     batch_size = cur_token.size(0)
     orig_input_pos = input_pos.clone().to(cur_token.device)
-    """
-    orig_input_pos = torch.tensor(
-        input_pos, dtype=torch.int64, device=cur_token.device
-    )
-    """
     draft_tokens, draft_probs, _ = decode_n_tokens(
         draft_model,
         cur_token.view(batch_size, -1),
@@ -314,33 +308,6 @@ def encode_tokens(tokenizer, string, bos=True, device="cuda"):
     return torch.tensor(tokens, dtype=torch.int, device=device)
 
 
-def _map_checkpoint(checkpoint):
-    import time
-    import re
-    from collections import defaultdict
-
-    keys_by_layer = defaultdict(lambda: defaultdict(list))
-    keys = checkpoint.keys()
-    for key in keys:
-        nums = re.findall(r"\d+", key)
-        if len(nums) == 3:
-            layer, _expert, w = nums
-            keys_by_layer[layer][w].append(key)
-    to = time.time()
-    for layer, layer_dict in keys_by_layer.items():
-        for w, v in layer_dict.items():
-            if w == "1" or w == "3":
-                collated_expert = torch.cat([checkpoint[k] for k in sorted(v)])
-            else:
-                collated_expert = torch.cat([checkpoint[k] for k in sorted(v)], dim=1).T
-            assert tuple(collated_expert.shape) == (114688, 4096), collated_expert.shape
-            checkpoint[f"layers.{layer}.block_sparse_moe.w{w}"] = collated_expert
-            for k in v:
-                del checkpoint[k]
-    print("Mutated checkpoint for BlockSparse", time.time() - to)
-    return
-
-
 def _load_model(checkpoint_path, device, precision, use_tp):
     with torch.device("meta"):
         model = Transformer.from_name(checkpoint_path.parent.name)
@@ -364,12 +331,6 @@ def _load_model(checkpoint_path, device, precision, use_tp):
 
     checkpoint = torch.load(str(checkpoint_path), mmap=True, weights_only=True)
     model.load_state_dict(checkpoint, assign=True)
-
-    for layer in model.layers:
-        if hasattr(layer, "block_sparse_moe") and hasattr(
-            layer.block_sparse_moe, "eye"
-        ):
-            layer.block_sparse_moe.eye = torch.eye(8).to(device)
 
     if use_tp:
         from tp import apply_tp
@@ -467,7 +428,7 @@ def main(
         )
 
         # Uncomment to squeeze more perf out of prefill
-        if args.compile_prefill:
+        if compile_prefill:
             print("Compiling prefill")
             prefill = torch.compile(prefill, fullgraph=fullgraph, dynamic=True)
 
