@@ -83,7 +83,7 @@ transformer_configs = {
         n_local_heads=4,
         intermediate_size=5632,
     ),
-    "mistral-instruct-tinyllama-draft": dict(
+    "tinyllama-1.3b-draft-13b-chat": dict(
         block_size=2048,
         vocab_size=32000,
         dim=2048,

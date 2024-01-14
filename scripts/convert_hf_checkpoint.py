@@ -81,6 +81,15 @@ def convert_hf_checkpoint(
             print(str(file))
             state_dict = torch.load(str(file), map_location="cpu", mmap=True)
         merged_result.update(state_dict)
+    update_keys = {}
+    for key, value in merged_result.items():
+        if key.startswith('module'):
+            update_keys[key] = key[7:]
+    if len(update_keys):
+        print(update_keys)
+        for key, new_key in update_keys.items():
+            merged_result[new_key] = merged_result[key]
+            del merged_result[key]
 
     final_result = {}
     for key, value in merged_result.items():
