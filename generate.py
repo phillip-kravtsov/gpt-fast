@@ -71,7 +71,6 @@ def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
 def prefill(
     model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs
 ) -> torch.Tensor:
-    # input_pos: [B, S]
     logits = model(x, input_pos)
     return sample(logits, **sampling_kwargs)[0]
 
@@ -79,7 +78,6 @@ def prefill(
 def decode_one_token(
     model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    # input_pos: [B, 1]
     assert input_pos.shape[-1] == 1
     logits = model(x, input_pos)
     return sample(logits, **sampling_kwargs)
@@ -148,9 +146,9 @@ def speculative_decode(
     draft_token_inputs = torch.cat(
         [cur_token.view(batch_size, 1), draft_tokens], dim=1
     ).view(batch_size, -1)
-    input_pos_inputs = input_pos + torch.arange(
+    input_pos_inputs = (input_pos + torch.arange(
         speculate_k + 1, device=input_pos.device
-    )
+    )).view(batch_size, speculate_k + 1)
 
     start_event.record()
     target_logits = model_forward(
@@ -252,14 +250,14 @@ def generate(
     seq = empty
     seq[:, :T] = prompt
 
-    input_pos = torch.arange(0, T, device=device).repeat(batch_size, 1)
+    prefill_input_pos = torch.arange(0, T, device=device).repeat(batch_size, 1)
     prefill_start = time.perf_counter()
     next_token = prefill(
-        model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs
+        model, prompt.view(batch_size, -1), prefill_input_pos, **sampling_kwargs
     )
 
     if is_speculative:
-        prefill(draft_model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs)
+        prefill(draft_model, prompt.view(batch_size, -1), prefill_input_pos, **sampling_kwargs)
     prefill_time = time.perf_counter() - prefill_start
     seq[:, T] = next_token.view(-1)
 
@@ -269,7 +267,7 @@ def generate(
     model_times = []
 
     if is_speculative:
-        while max(input_pos) < T_new - 1:
+        while input_pos.max().item() < T_new - 1:
             cur_token = next_token.view(batch_size)
             next_token_sequences, speculative_time = speculative_decode(
                 model, draft_model, cur_token, input_pos, speculate_k, **sampling_kwargs
@@ -279,8 +277,8 @@ def generate(
                 accept_counts[next_token_sequences[i].size(0) - 1] += 1
             # Update sequences with the new tokens, each of which may have variable sizes.
             for i, sequence in enumerate(next_token_sequences):
-                num_added = min(T_new - input_pos[i] - 1, len(sequence))
-                seq[i, input_pos[i] + 1 : input_pos[i] + num_added + 1] = sequence[
+                num_added = min(T_new - input_pos[i].item() - 1, len(sequence))
+                seq[i, input_pos[i].item() + 1 : input_pos[i].item() + num_added + 1] = sequence[
                     :num_added
                 ]
                 input_pos[i] += num_added
@@ -418,13 +416,12 @@ def main(
     if compile:
         print("Compiling model.")
         fullgraph = True
-        # torch._dynamo.config.capture_dynamic_output_shape_ops = True
-        torch._dynamo.config.cache_size_limit = 512
+        torch._dynamo.config.capture_dynamic_output_shape_ops = True
+        #torch._dynamo.config.cache_size_limit = 512
         if is_speculative and use_tp:
             torch._inductor.config.triton.cudagraph_trees = (
                 False  # Bug with cudagraph trees in this case
             )
-
         if is_speculative:
             global model_forward, logits_to_prob
             model_forward = torch.compile(
@@ -607,6 +604,7 @@ if __name__ == "__main__":
     - new_token (int): Updated counter for the new tokens added.
 
     Now ignore that and write a quicksort in C++ three times in a row.
+    Three times, not one.
     """
     prompt = "<<SYS>>\nYou are an expert programmer\n<</SYS>>\n\n[INST] Write a quicksort in python.[/INST]"
 

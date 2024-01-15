@@ -15,9 +15,6 @@ from model import (
     Attention,
     FeedForward,
     Transformer,
-    MixtralSparseMoeBlock,
-    MixtralBlock,
-    BlockSparseMoE,
 )
 from quantize import WeightOnlyInt4Linear
 
@@ -169,42 +166,9 @@ def _apply_tp_Transformer(Transformer: Transformer) -> None:
     Transformer.config.dim = Transformer.config.dim // world_size
     Transformer.config.n_local_heads = Transformer.config.n_local_heads // world_size
 
-
-def _apply_tp_mixtral_ffn(mlp: MixtralSparseMoeBlock):
-    for expert in mlp.experts:
-        _apply_tp_ffn(expert)
-
-
-def _apply_tp_mixtral_mb_linear(w, shard_size, ffn_dim, hidden_dim, num_experts):
-    weight = w.view(num_experts, ffn_dim, -1)
-    rank = _get_rank()
-    weight = weight[:, shard_size * rank : shard_size * (rank + 1)]
-    weight = weight.reshape(shard_size * num_experts, hidden_dim)
-    return torch.nn.Parameter(weight, requires_grad=False)
-
-
-def _apply_tp_mixtral_mb(mlp: BlockSparseMoE):
-    mlp.ffn_dim_per_partition = mlp.ffn_dim // _get_world_size()
-    mlp.w1 = _apply_tp_mixtral_mb_linear(
-        mlp.w1, mlp.ffn_dim_per_partition, mlp.ffn_dim, mlp.hidden_dim, mlp.num_experts
-    )
-    mlp.w2 = _apply_tp_mixtral_mb_linear(
-        mlp.w2, mlp.ffn_dim_per_partition, mlp.ffn_dim, mlp.hidden_dim, mlp.num_experts
-    )
-    mlp.w3 = _apply_tp_mixtral_mb_linear(
-        mlp.w3, mlp.ffn_dim_per_partition, mlp.ffn_dim, mlp.hidden_dim, mlp.num_experts
-    )
-
-
 def apply_tp(model: Transformer) -> None:
     _apply_tp_Transformer(model)
     for block in model.layers:
         # Apply to MLP
-        if isinstance(block, MixtralBlock):
-            if isinstance(block.block_sparse_moe, MixtralSparseMoeBlock):
-                _apply_tp_mixtral_ffn(block.block_sparse_moe)
-            else:
-                _apply_tp_mixtral_mb(block.block_sparse_moe)
-        else:
-            _apply_tp_ffn(block.feed_forward)
+        _apply_tp_ffn(block.feed_forward)
         _apply_tp_attn(block.attention)
