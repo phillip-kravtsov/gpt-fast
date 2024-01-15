@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import torch._dynamo.config
 import torch._inductor.config
+from transformers import MistralForCausalLM
 
 def device_sync(device):
     if "cuda" in device:
@@ -104,15 +105,6 @@ def decode_n_tokens(
             next_token, next_prob = decode_one_token(
                 model, cur_token, input_pos, **sampling_kwargs
             )
-<<<<<<< HEAD
-            input_pos += 1
-            new_tokens.append(next_token.clone())
-            callback(new_tokens[-1])
-            new_probs.append(next_prob.clone())
-            cur_token = next_token.view(1, -1)
-
-    return new_tokens, new_probs
-=======
             end_event.record()
             if RECORD_EVENTS:
                 torch.cuda.synchronize()
@@ -123,7 +115,6 @@ def decode_n_tokens(
         new_probs.append(next_prob.clone())
         cur_token = next_token.view(cur_token.size(0), -1)
     return new_tokens, new_probs, model_time
->>>>>>> 86b0d1e3b367482e0ffea2b19dcf5690134f6096
 
 
 def model_forward(model, x, input_pos, batch_index):
@@ -395,11 +386,7 @@ def main(
             # only print on rank 0
             print = lambda *args, **kwargs: None
 
-<<<<<<< HEAD
     print(f"Using device={device}")
-=======
-    device = "cuda:0"
->>>>>>> 86b0d1e3b367482e0ffea2b19dcf5690134f6096
     precision = torch.bfloat16
     is_speculative = draft_checkpoint_path is not None
     is_chat = "chat" in str(checkpoint_path)
@@ -429,10 +416,6 @@ def main(
         ]
     )
     if compile:
-<<<<<<< HEAD
-        if is_speculative and use_tp: # and ("cuda" in device):
-            torch._inductor.config.triton.cudagraph_trees = False # Bug with cudagraph trees in this case
-=======
         print("Compiling model.")
         fullgraph = True
         # torch._dynamo.config.capture_dynamic_output_shape_ops = True
@@ -441,7 +424,6 @@ def main(
             torch._inductor.config.triton.cudagraph_trees = (
                 False  # Bug with cudagraph trees in this case
             )
->>>>>>> 86b0d1e3b367482e0ffea2b19dcf5690134f6096
 
         if is_speculative:
             global model_forward, logits_to_prob
@@ -602,27 +584,6 @@ def main(
 if __name__ == "__main__":
     import argparse
 
-<<<<<<< HEAD
-    parser.add_argument('--prompt', type=str, default="Hello, my name is", help='Input prompt.')
-    parser.add_argument('--interactive', action='store_true', help='Whether to launch in interactive mode')
-    parser.add_argument('--num_samples', type=int, default=5, help='Number of samples.')
-    parser.add_argument('--max_new_tokens', type=int, default=200, help='Maximum number of new tokens.')
-    parser.add_argument('--top_k', type=int, default=200, help='Top-k for sampling.')
-    parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling.')
-    parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
-    parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
-    parser.add_argument('--compile_prefill', action='store_true', help='Whether to compile the prefill (improves prefill perf, but higher compile times)')
-    parser.add_argument('--profile', type=Path, default=None, help='Profile path.')
-    parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
-    parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
-    parser.add_argument('--device', type=str, default="cuda", help='device to use')
-
-    args = parser.parse_args()
-    main(
-        args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.top_k,
-        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
-        args.speculate_k, args.device
-=======
     parser = argparse.ArgumentParser(description="Your CLI description.")
     prompt = """
     Here's some irrelevant info:
@@ -709,5 +670,4 @@ if __name__ == "__main__":
         profile=args.profile,
         draft_checkpoint_path=args.draft_checkpoint_path,
         speculate_k=args.speculate_k,
->>>>>>> 86b0d1e3b367482e0ffea2b19dcf5690134f6096
     )
