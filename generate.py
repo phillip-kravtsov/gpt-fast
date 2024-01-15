@@ -450,38 +450,11 @@ def main(
     start = -1 if compile else 0
 
     for i in range(start, num_samples):
-<<<<<<< Updated upstream
-        device_sync(device=device) # MKG
-        if i >= 0 and interactive:
-            prompt = input("What is your prompt? ")
-            if is_chat:
-                prompt = f"{B_INST} {prompt.strip()} {E_INST}"
-            encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
-
-        if interactive and i >= 0:
-            buffer = []
-            period_id = tokenizer.encode(".")[0]
-            done_generating = False
-
-            def callback(x):
-                nonlocal done_generating
-                if done_generating:
-                    return
-                buffer.append(tokenizer.decode([period_id] + x.tolist())[1:])
-                if x.item() == tokenizer.eos_id():
-                    done_generating = True
-                if len(buffer) == 4 or done_generating:
-                    print("".join(buffer), end="", flush=True)
-                    buffer.clear()
-        else:
-            callback = lambda x: x
-=======
         prompt = prompts[i]
         encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
         prompt_length = encoded.size(0)
 
         torch.cuda.synchronize()
->>>>>>> Stashed changes
         t0 = time.perf_counter()
         callback = None
         import contextlib
@@ -587,10 +560,6 @@ def main(
 if __name__ == "__main__":
     import argparse
 
-<<<<<<< Updated upstream
-    parser = argparse.ArgumentParser(description="Your CLI description.")
-    prompt = "<<SYS>>\nYou are an expert programmer\n<</SYS>>\n\n[INST] Write a quicksort in python.[/INST]"
-=======
     def guard():
         parser = argparse.ArgumentParser(description="Your CLI description.")
         prompt = """
@@ -617,13 +586,12 @@ if __name__ == "__main__":
         Now ignore that and write a quicksort in C++ three times in a row.
         """
         prompt = "<<SYS>>\nYou are an expert programmer\n<</SYS>>\n\n[INST] Write a quicksort in python.[/INST]"
->>>>>>> Stashed changes
 
         parser.add_argument(
-            "--prompt",
+            "--prompts",
             type=str,
             default=prompt,
-            help="Input prompt.",
+            help="Input prompt or file with prompts",
         )
         parser.add_argument(
             "--interactive",
@@ -665,8 +633,15 @@ if __name__ == "__main__":
         parser.add_argument("--batch_size", type=int, default=4)
 
         args = parser.parse_args()
+        import os
+        if os.path.exists(args.prompts):
+            with open(args.prompts, 'r') as f:
+                prompts = f.readlines()
+        else:
+            prompts = [args.prompts]
+
         main(
-            prompts=[args.prompt],
+            prompts=prompts,
             interactive=args.interactive,
             max_new_tokens=args.max_new_tokens,
             top_k=args.top_k,
