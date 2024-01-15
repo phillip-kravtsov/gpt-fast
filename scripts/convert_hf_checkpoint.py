@@ -86,7 +86,6 @@ def convert_hf_checkpoint(
         if key.startswith('module'):
             update_keys[key] = key[7:]
     if len(update_keys):
-        print(update_keys)
         for key, new_key in update_keys.items():
             merged_result[new_key] = merged_result[key]
             del merged_result[key]

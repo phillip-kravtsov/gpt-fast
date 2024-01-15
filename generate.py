@@ -40,8 +40,9 @@ from model import Transformer
 from tp import maybe_init_dist
 
 PAD_TOKEN_ID = 1
-REPORT_PATH = "output.jsonl"
-RECORD_EVENTS = True
+EOS_TOKEN_ID = 2
+REPORT_PATH = "output-draft-tests.jsonl"
+RECORD_EVENTS = False
 
 
 def multinomial_sample_one_no_sync(
@@ -223,7 +224,8 @@ def generate(
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
     """
     print("Generating")
-    prompt = prompt.repeat(batch_size, 1)
+    if prompt.size(0) != batch_size:
+        prompt = prompt.repeat(batch_size, 1)
     T = prompt.size(1)
 
     is_speculative = draft_model is not None
@@ -263,11 +265,12 @@ def generate(
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int).repeat(batch_size, 1)
     accept_counts = [0] * (speculate_k + 1)
+    completed = torch.zeros((batch_size), dtype=torch.bool)
     speculative_times = []
     model_times = []
 
     if is_speculative:
-        while input_pos.max().item() < T_new - 1:
+        while input_pos.max().item() < T_new - 1 and not completed.all():
             cur_token = next_token.view(batch_size)
             next_token_sequences, speculative_time = speculative_decode(
                 model, draft_model, cur_token, input_pos, speculate_k, **sampling_kwargs
@@ -278,6 +281,8 @@ def generate(
             # Update sequences with the new tokens, each of which may have variable sizes.
             for i, sequence in enumerate(next_token_sequences):
                 num_added = min(T_new - input_pos[i].item() - 1, len(sequence))
+                if (sequence == EOS_TOKEN_ID).any():
+                    completed[i] = True
                 seq[i, input_pos[i].item() + 1 : input_pos[i].item() + num_added + 1] = sequence[
                     :num_added
                 ]
@@ -389,6 +394,7 @@ def main(
     is_speculative = draft_checkpoint_path is not None
     is_chat = "chat" in str(checkpoint_path)
     num_samples = len(prompts)
+
 
     print("Loading model ...")
     t0 = time.time()
@@ -523,7 +529,6 @@ def main(
     if is_speculative:
         print(aggregate_metrics["accept_counts"])
         counts_aggregated = [sum(i) for i in zip(*aggregate_metrics["accept_counts"])]
-        print(counts_aggregated)
         acceptance_probs = [i / sum(counts_aggregated) for i in counts_aggregated]
         print(f"Acceptance probs: {acceptance_probs}")
         mean_accepted = sum([idx * i for idx, i in enumerate(counts_aggregated)]) / sum(
@@ -635,11 +640,14 @@ if __name__ == "__main__":
         args = parser.parse_args()
         import os
         if os.path.exists(args.prompts):
+            assert args.prompts.endswith('jsonl')
+            import json
             with open(args.prompts, 'r') as f:
-                prompts = f.readlines()
+                prompts = [json.loads(l)['prompt'] for l in f.readlines()]
+            print('First prompt is:', prompts[0])
         else:
             prompts = [args.prompts]
-
+        prompts=prompts
         main(
             prompts=prompts,
             interactive=args.interactive,

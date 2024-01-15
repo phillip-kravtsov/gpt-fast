@@ -83,6 +83,15 @@ transformer_configs = {
         n_local_heads=4,
         intermediate_size=5632,
     ),
+    "tinyllama-1.3b-draft-llama-13b-chat": dict(
+        block_size=2048,
+        vocab_size=32000,
+        dim=2048,
+        n_layer=22,
+        n_head=32,
+        n_local_heads=4,
+        intermediate_size=5632,
+    ),
     "tinyllama-1.3b-draft-13b-chat": dict(
         block_size=2048,
         vocab_size=32000,

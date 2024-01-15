@@ -14,7 +14,10 @@ prompts = [tokenizer.apply_chat_template(
         add_generation_prompt=True,
 ) for instruction in instructions]
 
-with open('prompts.txt', 'w') as f:
+with open('prompts.jsonl', 'w') as f:
+    import json
     for prompt in prompts:
-        f.write(prompt + '\n')
+        f.write(json.dumps({"prompt": prompt + '\n'}))
+        f.write('\n')
+
 
