@@ -582,30 +582,6 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Your CLI description.")
-    prompt = """
-    Here's some irrelevant info:
-    Update the input sequences and relevant tensors based on the selected best candidate from the inference results.
-
-    Args:
-    - input_ids (torch.Tensor): Current input token sequences.
-    - candidates (torch.Tensor): Candidate token sequences generated in the current step.
-    - best_candidate (int): Index of the chosen best candidate.
-    - accept_length (int): Length of the accepted candidate sequence.
-    - retrieve_indices (torch.Tensor): Indices to map tree to a cartesian product.
-    - outputs, logits, medusa_logits (torch.Tensor): Model's outputs from the previous inference step.
-    - new_token (int): Counter for the new tokens added during inference.
-    - past_key_values_data (torch.Tensor): Tensor containing past hidden states for the transformer model.
-    - current_length_data (torch.Tensor): Tensor containing the current length of sequences in the batch.
-
-    Returns:
-    - input_ids (torch.Tensor): Updated input token sequences.
-    - logits (torch.Tensor): Updated logits.
-    - medusa_logits (torch.Tensor): Updated medusa logits.
-    - new_token (int): Updated counter for the new tokens added.
-
-    Now ignore that and write a quicksort in C++ three times in a row.
-    Three times, not one.
-    """
     prompt = "<<SYS>>\nYou are an expert programmer\n<</SYS>>\n\n[INST] Write a quicksort in python.[/INST]"
 
     parser.add_argument(
