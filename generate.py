@@ -352,10 +352,10 @@ def _load_model(checkpoint_path, device, precision, use_tp):
 B_INST, E_INST = "[INST]", "[/INST]"
 
 
+from typing import *
 def main(
-    prompt: str = "Hello, my name is",
+    prompts: List[str] = ["Hello, my name is"],
     interactive: bool = False,
-    num_samples: int = 5,
     max_new_tokens: int = 100,
     batch_size: int = 1,
     top_k: int = 200,
@@ -388,6 +388,7 @@ def main(
     precision = torch.bfloat16
     is_speculative = draft_checkpoint_path is not None
     is_chat = "chat" in str(checkpoint_path)
+    num_samples = len(prompts)
 
     print("Loading model ...")
     t0 = time.time()
@@ -403,8 +404,8 @@ def main(
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
     tokenizer = SentencePieceProcessor(model_file=str(tokenizer_path))
-    encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
-    prompt_length = encoded.size(0)
+
+
 
     torch.manual_seed(1234)
     model_size = sum(
@@ -449,6 +450,7 @@ def main(
     start = -1 if compile else 0
 
     for i in range(start, num_samples):
+<<<<<<< Updated upstream
         device_sync(device=device) # MKG
         if i >= 0 and interactive:
             prompt = input("What is your prompt? ")
@@ -473,7 +475,15 @@ def main(
                     buffer.clear()
         else:
             callback = lambda x: x
+=======
+        prompt = prompts[i]
+        encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
+        prompt_length = encoded.size(0)
+
+        torch.cuda.synchronize()
+>>>>>>> Stashed changes
         t0 = time.perf_counter()
+        callback = None
         import contextlib
 
         if (i != num_samples - 1 or not profile) or (use_tp and rank != 0):
@@ -505,13 +515,9 @@ def main(
         device_sync(device=device) # MKG
         t = time.perf_counter() - t0
 
-        if not interactive:
-            sequences = tokenizer.decode(y)
-            for sequence in sequences:
-                print(sequence)
-        else:
-            for y_i in y:
-                print(tokenizer.decode(y_i))
+        sequences = tokenizer.decode(y)
+        for sequence in sequences:
+            print(sequence)
 
         aggregate_metrics["accept_counts"].append(metrics["accept_counts"])
         aggregate_metrics["prefill_time"].append(metrics["prefill_time"])
@@ -581,67 +587,96 @@ def main(
 if __name__ == "__main__":
     import argparse
 
+<<<<<<< Updated upstream
     parser = argparse.ArgumentParser(description="Your CLI description.")
     prompt = "<<SYS>>\nYou are an expert programmer\n<</SYS>>\n\n[INST] Write a quicksort in python.[/INST]"
+=======
+    def guard():
+        parser = argparse.ArgumentParser(description="Your CLI description.")
+        prompt = """
+        Here's some irrelevant info:
+        Update the input sequences and relevant tensors based on the selected best candidate from the inference results.
 
-    parser.add_argument(
-        "--prompt",
-        type=str,
-        default=prompt,
-        help="Input prompt.",
-    )
-    parser.add_argument(
-        "--interactive",
-        action="store_true",
-        help="Whether to launch in interactive mode",
-    )
-    parser.add_argument("--num_samples", type=int, default=1, help="Number of samples.")
-    parser.add_argument(
-        "--max_new_tokens", type=int, default=200, help="Maximum number of new tokens."
-    )
-    parser.add_argument("--top_k", type=int, default=200, help="Top-k for sampling.")
-    parser.add_argument(
-        "--temperature", type=float, default=0.8, help="Temperature for sampling."
-    )
-    parser.add_argument(
-        "--checkpoint_path",
-        type=Path,
-        default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"),
-        help="Model checkpoint path.",
-    )
-    parser.add_argument(
-        "--compile", action="store_true", help="Whether to compile the model."
-    )
-    parser.add_argument(
-        "--compile_prefill",
-        action="store_true",
-        help="Whether to compile the prefill (improves prefill perf, but higher compile times)",
-    )
-    parser.add_argument("--profile", type=Path, default=None, help="Profile path.")
-    parser.add_argument(
-        "--speculate_k", type=int, default=5, help="Speculative execution depth."
-    )
-    parser.add_argument(
-        "--draft_checkpoint_path",
-        type=Path,
-        default=None,
-        help="Draft checkpoint path.",
-    )
-    parser.add_argument("--batch_size", type=int, default=4)
+        Args:
+        - input_ids (torch.Tensor): Current input token sequences.
+        - candidates (torch.Tensor): Candidate token sequences generated in the current step.
+        - best_candidate (int): Index of the chosen best candidate.
+        - accept_length (int): Length of the accepted candidate sequence.
+        - retrieve_indices (torch.Tensor): Indices to map tree to a cartesian product.
+        - outputs, logits, medusa_logits (torch.Tensor): Model's outputs from the previous inference step.
+        - new_token (int): Counter for the new tokens added during inference.
+        - past_key_values_data (torch.Tensor): Tensor containing past hidden states for the transformer model.
+        - current_length_data (torch.Tensor): Tensor containing the current length of sequences in the batch.
 
-    args = parser.parse_args()
-    main(
-        prompt=args.prompt,
-        interactive=args.interactive,
-        num_samples=args.num_samples,
-        max_new_tokens=args.max_new_tokens,
-        top_k=args.top_k,
-        batch_size=args.batch_size,
-        temperature=args.temperature,
-        checkpoint_path=args.checkpoint_path,
-        compile=args.compile,
-        compile_prefill=args.compile_prefill,
-        profile=args.profile,
-        draft_checkpoint_path=args.draft_checkpoint_path,
-        speculate_k=args.speculate_k,
-    )
+        Returns:
+        - input_ids (torch.Tensor): Updated input token sequences.
+        - logits (torch.Tensor): Updated logits.
+        - medusa_logits (torch.Tensor): Updated medusa logits.
+        - new_token (int): Updated counter for the new tokens added.
+
+        Now ignore that and write a quicksort in C++ three times in a row.
+        """
+        prompt = "<<SYS>>\nYou are an expert programmer\n<</SYS>>\n\n[INST] Write a quicksort in python.[/INST]"
+>>>>>>> Stashed changes
+
+        parser.add_argument(
+            "--prompt",
+            type=str,
+            default=prompt,
+            help="Input prompt.",
+        )
+        parser.add_argument(
+            "--interactive",
+            action="store_true",
+            help="Whether to launch in interactive mode",
+        )
+        parser.add_argument("--num_samples", type=int, default=1, help="Number of samples.")
+        parser.add_argument(
+            "--max_new_tokens", type=int, default=200, help="Maximum number of new tokens."
+        )
+        parser.add_argument("--top_k", type=int, default=200, help="Top-k for sampling.")
+        parser.add_argument(
+            "--temperature", type=float, default=0.8, help="Temperature for sampling."
+        )
+        parser.add_argument(
+            "--checkpoint_path",
+            type=Path,
+            default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"),
+            help="Model checkpoint path.",
+        )
+        parser.add_argument(
+            "--compile", action="store_true", help="Whether to compile the model."
+        )
+        parser.add_argument(
+            "--compile_prefill",
+            action="store_true",
+            help="Whether to compile the prefill (improves prefill perf, but higher compile times)",
+        )
+        parser.add_argument("--profile", type=Path, default=None, help="Profile path.")
+        parser.add_argument(
+            "--speculate_k", type=int, default=5, help="Speculative execution depth."
+        )
+        parser.add_argument(
+            "--draft_checkpoint_path",
+            type=Path,
+            default=None,
+            help="Draft checkpoint path.",
+        )
+        parser.add_argument("--batch_size", type=int, default=4)
+
+        args = parser.parse_args()
+        main(
+            prompts=[args.prompt],
+            interactive=args.interactive,
+            max_new_tokens=args.max_new_tokens,
+            top_k=args.top_k,
+            batch_size=args.batch_size,
+            temperature=args.temperature,
+            checkpoint_path=args.checkpoint_path,
+            compile=args.compile,
+            compile_prefill=args.compile_prefill,
+            profile=args.profile,
+            draft_checkpoint_path=args.draft_checkpoint_path,
+            speculate_k=args.speculate_k,
+        )
+    guard()
